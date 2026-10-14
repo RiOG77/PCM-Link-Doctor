@@ -1,22 +1,38 @@
 package com.pcmlink.doctor;
 
+import android.app.KeyguardManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
+import android.hardware.usb.UsbManager;
+import android.os.BatteryManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 
 import java.io.File;
-import java.util.LinkedHashSet;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
 import java.util.Locale;
-import java.util.Set;
+import java.util.Map;
+import java.util.TimeZone;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -26,6 +42,7 @@ import rikka.shizuku.Shizuku;
 public class DiagnosticService extends Service {
     public static final String ACTION_START = "com.pcmlink.doctor.START";
     public static final String ACTION_STOP = "com.pcmlink.doctor.STOP";
+    public static final String ACTION_MARK_CAR = "com.pcmlink.doctor.MARK_CAR";
     public static final String ACTION_MARK_FAILED = "com.pcmlink.doctor.MARK_FAILED";
     public static final String ACTION_MARK_RECOVERED = "com.pcmlink.doctor.MARK_RECOVERED";
     public static final String ACTION_STATE = "com.pcmlink.doctor.STATE";
@@ -39,54 +56,123 @@ public class DiagnosticService extends Service {
     public static final String KEY_AA = "aa";
     public static final String KEY_LEVEL = "level";
 
-    private static final int SAFE_SHIZUKU_UID = 2000;
+    private static final String USB_STATE_ACTION = "android.hardware.usb.action.USB_STATE";
     private static final int NOTIFICATION_ID = 8401;
     private static final String CHANNEL_ID = "pcm_link_diagnostics";
+    private static final long STUCK_MS = 10_000L;
 
-    private ScheduledExecutorService scheduler;
-    private final Set<String> seenLogLines = new LinkedHashSet<>();
-    private final Object logLock = new Object();
-    private IRemoteShell shell;
-    private Shizuku.UserServiceArgs userServiceArgs;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final ScheduledExecutorService logScheduler = Executors.newSingleThreadScheduledExecutor();
+    private final Map<String, Integer> logSignatureCounts = new ConcurrentHashMap<>();
+    private final List<Long> attachToAccessoryMs = new ArrayList<>();
+    private final List<Long> accessoryDurationsMs = new ArrayList<>();
+
     private File sessionDir;
     private PowerManager.WakeLock wakeLock;
-
-    private boolean previousUsbPowered;
-    private boolean previousAccessory;
-    private String previousUsbState = "";
-    private String previousAaPid = "";
-    private long usbConnectedAt;
-    private long lastPtpAt;
-    private boolean stuckReported;
+    private VerifiedShell shell;
+    private Shizuku.UserServiceArgs userServiceArgs;
+    private boolean bindingShell;
+    private boolean enhancedEverAvailable;
+    private boolean receiverRegistered;
     private boolean started;
+
+    private boolean usbConnected;
+    private boolean usbConfigured;
+    private boolean usbAccessory;
+    private boolean usbMtp;
+    private boolean usbPtp;
+    private boolean usbAdb;
+    private boolean usbPower;
+    private boolean carMarked;
+    private boolean wiredAdbSeen;
+    private boolean usbStateSeen;
+    private boolean projectionProcessSeen;
+    private long attachElapsed = -1L;
+    private long ptpElapsed = -1L;
+    private long accessoryStartElapsed = -1L;
+    private int attachCount;
+    private int detachCount;
+    private String lastUsbFingerprint = "";
+    private String lastPropsFingerprint = "";
+    private long logCursorMs;
+    private Boolean lastInteractive;
+    private Boolean lastKeyguardLocked;
+
+    private final Runnable stuckCheck = () -> {
+        if (!started || !usbConnected || !usbConfigured || usbAccessory) return;
+        event("WARN", "Возможен зависший handshake",
+                "USB connected+configured уже 10 с, но accessory mode не появился"
+                        + (carMarked ? "; пользователь отметил подключение к авто" : ""));
+        captureDeepSnapshot("stuck_handshake");
+    };
+
+    private final Shizuku.OnBinderReceivedListener binderReceivedListener = () -> {
+        if (!started) return;
+        verifyBackendAndMaybeBind("Shizuku binder received");
+    };
+
+    private final Shizuku.OnBinderDeadListener binderDeadListener = () -> {
+        shell = null;
+        bindingShell = false;
+        if (started) {
+            event("WARN", "Shizuku потерян", "Продолжаю базовую USB-диагностику без Shizuku");
+            publishState();
+        }
+    };
 
     private final ServiceConnection shellConnection = new ServiceConnection() {
         @Override public void onServiceConnected(ComponentName name, IBinder service) {
-            IRemoteShell candidate = IRemoteShell.Stub.asInterface(service);
+            bindingShell = false;
             try {
-                int uid = candidate.uid();
-                if (uid != SAFE_SHIZUKU_UID) {
-                    rejectUnsafeShizuku(uid);
-                    return;
-                }
-
-                shell = candidate;
-                event("GOOD", "Knox-safe проверка пройдена",
-                        "Shizuku uid=2000 (Android shell). Root не используется");
-                captureDeviceDetails();
-                publishState("Жду подключения кабеля", "—", "—", "—", "IDLE");
+                IRemoteShell candidate = IRemoteShell.Stub.asInterface(service);
+                VerifiedShell verified = VerifiedShell.verify(candidate);
+                shell = verified;
+                enhancedEverAvailable = true;
+                event("GOOD", "Расширенная диагностика включена",
+                        "Shizuku uid=" + verified.uid() + ", SELinux=" + verified.selinuxContext());
+                SessionStore.append(sessionDir, "shell_identity.txt",
+                        SessionStore.isoNow() + " uid=" + verified.uid()
+                                + " context=" + verified.selinuxContext());
+                captureLightSnapshot("shizuku_verified");
+                publishState();
             } catch (Throwable t) {
                 shell = null;
-                event("BAD", "Ошибка проверки Shizuku", String.valueOf(t.getMessage()));
-                publishState("Не удалось проверить Shizuku", "—", "—", "—", "BAD");
+                event("BAD", "Shizuku заблокирован Knox-safe policy",
+                        "UserService не прошёл UID/SELinux проверку: " + t.getMessage());
+                publishState();
             }
         }
 
         @Override public void onServiceDisconnected(ComponentName name) {
             shell = null;
+            bindingShell = false;
             if (started) {
-                event("WARN", "Shizuku отключён", "Системная USB-диагностика приостановлена");
-                publishState("Жду Shizuku", "—", "—", "—", "WARN");
+                event("WARN", "Shizuku UserService отключён", "Базовая диагностика продолжает работать");
+                publishState();
+            }
+        }
+    };
+
+    private final BroadcastReceiver systemReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (!started || intent == null || intent.getAction() == null) return;
+            String action = intent.getAction();
+            if (USB_STATE_ACTION.equals(action)) {
+                handleUsbState(intent);
+            } else if (UsbManager.ACTION_USB_ACCESSORY_ATTACHED.equals(action)) {
+                event("GOOD", "USB accessory attached", "UsbManager ACTION_USB_ACCESSORY_ATTACHED");
+                mainHandler.postDelayed(() -> captureDeepSnapshot("accessory_attached"), 1200L);
+            } else if (UsbManager.ACTION_USB_ACCESSORY_DETACHED.equals(action)) {
+                event("INFO", "USB accessory detached", "UsbManager ACTION_USB_ACCESSORY_DETACHED");
+            } else if (Intent.ACTION_BATTERY_CHANGED.equals(action)) {
+                handleBattery(intent);
+            } else if (Intent.ACTION_SCREEN_ON.equals(action)) {
+                event("INFO", "Экран включён", lockState());
+            } else if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                event("INFO", "Экран выключен", lockState());
+            } else if (Intent.ACTION_USER_PRESENT.equals(action)) {
+                event("INFO", "Телефон разблокирован", lockState());
             }
         }
     };
@@ -94,10 +180,11 @@ public class DiagnosticService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         createChannel();
-        scheduler = Executors.newScheduledThreadPool(2);
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PCMLinkDoctor:diagnostics");
         wakeLock.setReferenceCounted(false);
+        Shizuku.addBinderReceivedListenerSticky(binderReceivedListener);
+        Shizuku.addBinderDeadListener(binderDeadListener);
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -106,17 +193,19 @@ public class DiagnosticService extends Service {
             stopDiagnostics();
             return START_NOT_STICKY;
         }
-        if (ACTION_MARK_FAILED.equals(action)) {
-            event("BAD", "Метка: AA не запустился", currentCompactState());
-            snapshotNow("marker_failed");
-            return START_STICKY;
-        }
-        if (ACTION_MARK_RECOVERED.equals(action)) {
-            event("GOOD", "Метка: после PTP заработало", currentCompactState());
-            snapshotNow("marker_recovered");
-            return START_STICKY;
-        }
         if (!started) startDiagnostics();
+
+        if (ACTION_MARK_CAR.equals(action)) {
+            carMarked = true;
+            event("INFO", "Метка: подключено к авто", currentUsbSummary() + "; " + lockState());
+            captureLightSnapshot("manual_car_marker");
+        } else if (ACTION_MARK_FAILED.equals(action)) {
+            event("BAD", "Метка: AA не запустился", currentUsbSummary() + "; " + lockState());
+            captureDeepSnapshot("marker_failed");
+        } else if (ACTION_MARK_RECOVERED.equals(action)) {
+            event("GOOD", "Метка: после PTP заработало", currentUsbSummary() + "; " + lockState());
+            captureDeepSnapshot("marker_recovered");
+        }
         return START_STICKY;
     }
 
@@ -124,205 +213,364 @@ public class DiagnosticService extends Service {
         started = true;
         sessionDir = SessionStore.startSession(this);
         getSharedPreferences(PREF, MODE_PRIVATE).edit().putBoolean(KEY_RUNNING, true).apply();
-        startForeground(NOTIFICATION_ID, buildNotification());
+        Notification notification = buildNotification();
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
         if (!wakeLock.isHeld()) wakeLock.acquire(4 * 60 * 60 * 1000L);
-        event("INFO", "Диагностика запущена", "Сначала проверяю Knox-safe режим Shizuku");
-        bindShell();
-        scheduler.scheduleAtFixedRate(this::pollUsb, 500, 1200, TimeUnit.MILLISECONDS);
-        scheduler.scheduleAtFixedRate(this::pollLogcat, 1200, 2200, TimeUnit.MILLISECONDS);
+        registerSystemSignals();
+        logCursorMs = Math.max(0, System.currentTimeMillis() - 3000L);
+        event("INFO", "Диагностика запущена",
+                "Базовый событийный режим активен; Shizuku опционален");
+        logLockStateIfChanged("session_start");
+        verifyBackendAndMaybeBind("session start");
+        logScheduler.scheduleAtFixedRate(this::captureLogcatWindow, 2, 4, TimeUnit.SECONDS);
+        publishState();
     }
 
-    private void bindShell() {
+    private void registerSystemSignals() {
+        if (receiverRegistered) return;
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(USB_STATE_ACTION);
+        filter.addAction(UsbManager.ACTION_USB_ACCESSORY_ATTACHED);
+        filter.addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED);
+        filter.addAction(Intent.ACTION_BATTERY_CHANGED);
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        filter.addAction(Intent.ACTION_USER_PRESENT);
+        Intent sticky;
+        if (Build.VERSION.SDK_INT >= 33) {
+            sticky = registerReceiver(systemReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            sticky = registerReceiver(systemReceiver, filter);
+        }
+        receiverRegistered = true;
+        if (sticky != null) {
+            if (USB_STATE_ACTION.equals(sticky.getAction())) handleUsbState(sticky);
+            if (Intent.ACTION_BATTERY_CHANGED.equals(sticky.getAction())) handleBattery(sticky);
+        }
+    }
+
+    private void handleUsbState(Intent intent) {
+        usbStateSeen = true;
+        long now = SystemClock.elapsedRealtime();
+        boolean connected = intent.getBooleanExtra("connected", false);
+        boolean configured = intent.getBooleanExtra("configured", false);
+        boolean accessory = intent.getBooleanExtra("accessory", false);
+        boolean mtp = intent.getBooleanExtra("mtp", false);
+        boolean ptp = intent.getBooleanExtra("ptp", false);
+        boolean adb = intent.getBooleanExtra("adb", false);
+        boolean changed = connected != usbConnected || configured != usbConfigured
+                || accessory != usbAccessory || mtp != usbMtp || ptp != usbPtp || adb != usbAdb;
+
+        if (connected && !usbConnected) {
+            attachCount++;
+            attachElapsed = now;
+            ptpElapsed = -1L;
+            event("INFO", "USB подключён", "USB_STATE connected=true");
+        }
+        if (!connected && usbConnected) {
+            detachCount++;
+            finishAccessoryDuration(now);
+            event("INFO", "USB отключён", "USB_STATE connected=false");
+            mainHandler.removeCallbacks(stuckCheck);
+            attachElapsed = -1L;
+            ptpElapsed = -1L;
+        }
+        if (configured && !usbConfigured) {
+            event("INFO", "USB сконфигурирован", "connected=true, configured=true");
+            mainHandler.removeCallbacks(stuckCheck);
+            mainHandler.postDelayed(stuckCheck, STUCK_MS);
+        }
+        if (!configured && usbConfigured && connected) {
+            event("WARN", "USB configuration потеряна", "connected=true, configured=false");
+            mainHandler.removeCallbacks(stuckCheck);
+        }
+        if (ptp && !usbPtp) {
+            ptpElapsed = now;
+            event("INFO", "PTP включён", "USB_STATE ptp=true");
+        }
+        if (mtp && !usbMtp) {
+            event("INFO", "MTP включён", "USB_STATE mtp=true");
+        }
+        if (adb != usbAdb) {
+            if (adb) {
+                wiredAdbSeen = true;
+                event("WARN", "В USB-конфигурации появился adb",
+                        "Это меняет наблюдаемую USB-конфигурацию; для теста используйте Wireless debugging");
+            } else {
+                event("INFO", "adb исчез из USB-конфигурации", "USB_STATE adb=false");
+            }
+        }
+        if (accessory && !usbAccessory) {
+            accessoryStartElapsed = now;
+            mainHandler.removeCallbacks(stuckCheck);
+            long fromAttach = attachElapsed > 0 ? now - attachElapsed : -1L;
+            if (fromAttach >= 0) attachToAccessoryMs.add(fromAttach);
+            StringBuilder detail = new StringBuilder("accessory=true");
+            if (fromAttach >= 0) detail.append("; attach→accessory=").append(fromAttach).append(" ms");
+            if (ptpElapsed > 0) detail.append("; PTP→accessory=").append(now - ptpElapsed).append(" ms");
+            event("GOOD", ptpElapsed > 0 ? "PTP → accessory" : "Accessory mode активирован", detail.toString());
+            mainHandler.postDelayed(() -> captureDeepSnapshot("accessory_stable"), 1200L);
+        }
+        if (!accessory && usbAccessory) {
+            finishAccessoryDuration(now);
+            event("INFO", "Accessory mode завершён", "accessory=false");
+        }
+
+        usbConnected = connected;
+        usbConfigured = configured;
+        usbAccessory = accessory;
+        usbMtp = mtp;
+        usbPtp = ptp;
+        usbAdb = adb;
+
+        if (changed) {
+            writeUsbStateIfChanged();
+            logLockStateIfChanged("usb_state");
+            captureLightSnapshot("usb_state_change");
+            publishState();
+        }
+    }
+
+    private void handleBattery(Intent intent) {
+        int plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+        boolean powered = (plugged & BatteryManager.BATTERY_PLUGGED_USB) != 0;
+        if (powered != usbPower) {
+            usbPower = powered;
+            event("INFO", powered ? "USB-питание появилось" : "USB-питание пропало",
+                    "BatteryManager; не используется как критерий handshake");
+        }
+    }
+
+    private void finishAccessoryDuration(long now) {
+        if (accessoryStartElapsed > 0) {
+            long duration = Math.max(0, now - accessoryStartElapsed);
+            accessoryDurationsMs.add(duration);
+            accessoryStartElapsed = -1L;
+        }
+    }
+
+    private void writeUsbStateIfChanged() {
+        String value = SessionStore.isoNow() + " elapsed=" + SystemClock.elapsedRealtime()
+                + " connected=" + usbConnected
+                + " configured=" + usbConfigured
+                + " accessory=" + usbAccessory
+                + " mtp=" + usbMtp
+                + " ptp=" + usbPtp
+                + " adb=" + usbAdb
+                + " power=" + usbPower;
+        String fingerprint = value.substring(value.indexOf(" connected="));
+        if (fingerprint.equals(lastUsbFingerprint)) return;
+        lastUsbFingerprint = fingerprint;
+        SessionStore.append(sessionDir, "raw_usb.txt", value);
+    }
+
+    private void verifyBackendAndMaybeBind(String reason) {
         try {
             if (!Shizuku.pingBinder()) {
-                event("WARN", "Shizuku недоступен", "Запусти Shizuku и вернись в приложение");
-                publishState("Жду Shizuku", "—", "—", "—", "WARN");
+                shell = null;
+                event("WARN", "Shizuku недоступен", "Базовая диагностика продолжает работать");
+                return;
+            }
+            int backendUid = Shizuku.getUid();
+            if (!ShellIdentityPolicy.isSafeBackendUid(backendUid)) {
+                shell = null;
+                bindingShell = false;
+                event("BAD", "Shizuku root/unsafe mode заблокирован",
+                        reason + ": backend uid=" + backendUid + "; bindUserService НЕ выполнялся");
+                publishState();
                 return;
             }
             if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-                event("WARN", "Нет разрешения Shizuku", "Разреши PCM Link Doctor в Shizuku");
-                publishState("Нужно разрешение Shizuku", "—", "—", "—", "WARN");
+                shell = null;
+                event("WARN", "Shizuku без разрешения", "Базовая диагностика активна; расширенные снимки выключены");
                 return;
             }
+            if (bindingShell || shell != null) return;
+
             userServiceArgs = new Shizuku.UserServiceArgs(
                     new ComponentName(getPackageName(), ShellUserService.class.getName()))
                     .processNameSuffix("diagnostics")
                     .debuggable(BuildConfig.DEBUG)
-                    .version(2)
+                    .version(BuildConfig.VERSION_CODE)
                     .daemon(false)
                     .tag("pcm_link_shell");
+            bindingShell = true;
             Shizuku.bindUserService(userServiceArgs, shellConnection);
         } catch (Throwable t) {
-            event("BAD", "Не удалось подключить Shizuku", String.valueOf(t.getMessage()));
-            publishState("Ошибка Shizuku", "—", "—", "—", "BAD");
+            shell = null;
+            bindingShell = false;
+            event("WARN", "Расширенная диагностика недоступна", String.valueOf(t.getMessage()));
         }
     }
 
-    private void rejectUnsafeShizuku(int uid) {
-        String mode = uid == 0 ? "root (uid=0)" : "uid=" + uid;
-        event("BAD", "Knox-safe блокировка",
-                "Обнаружен Shizuku " + mode + ". Разрешён только Android shell uid=2000. Диагностика остановлена.");
-        publishState("ЗАБЛОКИРОВАНО: небезопасный Shizuku", "—", "—", "—", "BAD");
-        started = false;
-        getSharedPreferences(PREF, MODE_PRIVATE).edit().putBoolean(KEY_RUNNING, false).apply();
-        try {
-            if (userServiceArgs != null && Shizuku.pingBinder()) {
-                Shizuku.unbindUserService(userServiceArgs, shellConnection, true);
-            }
-        } catch (Throwable ignored) {}
-        shell = null;
-        if (scheduler != null) scheduler.shutdownNow();
-        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
-        stopForeground(STOP_FOREGROUND_REMOVE);
-        stopSelf();
-    }
-
-    private void pollUsb() {
-        IRemoteShell s = shell;
-        if (s == null) return;
-        try {
-            String out = s.exec("echo __STATE__; getprop sys.usb.state; "
-                    + "echo __CONFIG__; getprop sys.usb.config; "
-                    + "echo __BATTERY__; dumpsys battery | grep -i -E 'USB powered|powered:|AC powered|Wireless powered' | head -n 8; "
-                    + "echo __USB__; dumpsys usb 2>/dev/null | grep -i -E 'connected|configured|current.*function|screen.*function|accessory|mtp|ptp|data unlocked|host connected' | head -n 120; "
-                    + "echo __AA_PID__; pidof com.google.android.projection.gearhead 2>/dev/null || true");
-            handleParsed(Parsed.from(out), out);
-        } catch (Throwable t) {
-            event("WARN", "Ошибка чтения USB", t.getClass().getSimpleName() + ": " + t.getMessage());
-        }
-    }
-
-    private void handleParsed(Parsed p, String raw) {
-        long now = System.currentTimeMillis();
-
-        if (p.usbPowered != previousUsbPowered) {
-            previousUsbPowered = p.usbPowered;
-            if (p.usbPowered) {
-                usbConnectedAt = now;
-                stuckReported = false;
-                event("INFO", "USB подключён", "PCM/кабель подал USB-питание");
-                SessionStore.append(sessionDir, "raw_usb.txt", "\n=== USB CONNECT " + SessionStore.isoNow() + " ===\n" + raw);
-            } else {
-                usbConnectedAt = 0L;
-                stuckReported = false;
-                event("INFO", "USB отключён", "Соединение завершено");
-                SessionStore.append(sessionDir, "raw_usb.txt", "\n=== USB DISCONNECT " + SessionStore.isoNow() + " ===\n" + raw);
-            }
-        }
-
-        if (!p.usbState.equals(previousUsbState)) {
-            String old = previousUsbState;
-            previousUsbState = p.usbState;
-            if (!p.usbState.isBlank()) {
-                event("INFO", "USB-функции изменились", (old.isBlank() ? "—" : old) + " → " + p.usbState);
-                SessionStore.append(sessionDir, "raw_usb.txt", "\n=== USB STATE " + SessionStore.isoNow() + " ===\n" + raw);
-            }
-            if (containsToken(p.usbState, "ptp")) lastPtpAt = now;
-        }
-
-        if (p.accessory != previousAccessory) {
-            previousAccessory = p.accessory;
-            if (p.accessory) {
-                if (lastPtpAt > 0 && now - lastPtpAt <= 15_000) {
-                    event("GOOD", "PTP → accessory", "Handshake появился через "
-                            + String.format(Locale.US, "%.1f", (now - lastPtpAt) / 1000.0) + " c");
-                } else {
-                    event("GOOD", "Accessory mode активирован", "Телефон перешёл в USB AOA/accessory mode");
-                }
-                snapshotNow("accessory_on");
-            } else if (p.usbPowered) {
-                event("WARN", "Accessory mode пропал", "USB всё ещё подключён");
-            }
-        }
-
-        if (!p.aaPid.equals(previousAaPid)) {
-            boolean was = !previousAaPid.isBlank();
-            boolean is = !p.aaPid.isBlank();
-            previousAaPid = p.aaPid;
-            if (!was && is) event("INFO", "Android Auto процесс активен", "gearhead pid=" + p.aaPid);
-            if (was && !is) event("INFO", "Android Auto процесс завершился", "gearhead больше не обнаружен");
-        }
-
-        if (p.usbPowered && !p.accessory && usbConnectedAt > 0
-                && now - usbConnectedAt > 10_000 && !stuckReported) {
-            stuckReported = true;
-            event("WARN", "Возможен зависший handshake", "USB есть >10 c, но accessory mode не появился");
-            snapshotNow("stuck_handshake");
-        }
-
-        String main;
-        String level;
-        if (!p.usbPowered) {
-            main = "Жду подключения кабеля";
-            level = "IDLE";
-        } else if (p.accessory) {
-            main = "Handshake найден";
-            level = "GOOD";
-        } else if (usbConnectedAt > 0 && now - usbConnectedAt > 10_000) {
-            main = "USB есть, handshake не найден";
-            level = "WARN";
-        } else {
-            main = "USB подключён — анализирую";
-            level = "INFO";
-        }
-        publishState(main,
-                p.usbPowered ? (p.usbState.isBlank() ? "подключён" : p.usbState) : "—",
-                p.accessory ? "активен" : (p.usbPowered ? "нет" : "—"),
-                p.aaPid.isBlank() ? "—" : "процесс есть",
-                level);
-    }
-
-    private void pollLogcat() {
-        IRemoteShell s = shell;
+    private void captureLightSnapshot(String reason) {
+        VerifiedShell s = shell;
         if (s == null || sessionDir == null) return;
-        try {
-            String out = s.exec("logcat -b main -b system -d -v threadtime -t 220 2>/dev/null | grep -i -E 'usb|accessory|aoa|projection|gearhead|android.?auto|carservice|mtp|ptp' | tail -n 180");
-            if (out == null || out.isBlank()) return;
-            StringBuilder fresh = new StringBuilder();
-            synchronized (logLock) {
-                for (String line : out.split("\\R")) {
-                    if (line.isBlank() || seenLogLines.contains(line)) continue;
-                    seenLogLines.add(line);
-                    fresh.append(line).append('\n');
-                }
-                if (seenLogLines.size() > 2500) seenLogLines.clear();
-            }
-            if (fresh.length() > 0) SessionStore.append(sessionDir, "logcat_filtered.txt", fresh.toString());
-        } catch (Throwable ignored) {}
-    }
-
-    private void captureDeviceDetails() {
-        IRemoteShell s = shell;
-        if (s == null || sessionDir == null) return;
-        try {
-            String details = s.exec("echo '--- Knox-safe Shizuku mode ---'; id; "
-                    + "echo '--- USB props ---'; getprop | grep -i -E '\\[.*usb.*\\]|persist.sys.usb'; "
-                    + "echo '--- Android Auto package ---'; dumpsys package com.google.android.projection.gearhead 2>/dev/null | grep -i -E 'versionName|versionCode|firstInstallTime|lastUpdateTime' | head -n 20");
-            SessionStore.append(sessionDir, "device.txt", "\n" + details);
-        } catch (Throwable ignored) {}
-    }
-
-    private void snapshotNow(String reason) {
-        IRemoteShell s = shell;
-        if (s == null || sessionDir == null || scheduler == null || scheduler.isShutdown()) return;
-        scheduler.execute(() -> {
+        io.execute(() -> {
             try {
-                String cmd = "echo '=== SNAPSHOT " + reason + " ==='; date '+%Y-%m-%d %H:%M:%S.%3N %z'; "
-                        + "echo '--- usb props ---'; getprop sys.usb.state; getprop sys.usb.config; "
-                        + "echo '--- dumpsys usb ---'; dumpsys usb 2>/dev/null | head -n 280; "
-                        + "echo '--- battery ---'; dumpsys battery | head -n 80; "
-                        + "echo '--- AA process ---'; ps -A 2>/dev/null | grep -i 'projection.gearhead' || true; "
-                        + "echo '--- filtered log ---'; logcat -b main -b system -d -v threadtime -t 450 2>/dev/null | grep -i -E 'usb|accessory|aoa|projection|gearhead|android.?auto|carservice|mtp|ptp' | tail -n 320";
-                SessionStore.append(sessionDir, "snapshots.txt", "\n" + s.exec(cmd));
-            } catch (Throwable ignored) {}
+                String state = s.exec("/system/bin/getprop", "sys.usb.state");
+                String config = s.exec("/system/bin/getprop", "sys.usb.config");
+                String persist = s.exec("/system/bin/getprop", "persist.sys.usb.config");
+                String body = SessionStore.isoNow() + " reason=" + reason
+                        + "\nsys.usb.state=" + state
+                        + "\nsys.usb.config=" + config
+                        + "\npersist.sys.usb.config=" + persist + "\n";
+                String fp = state + "|" + config + "|" + persist;
+                if (!fp.equals(lastPropsFingerprint)) {
+                    lastPropsFingerprint = fp;
+                    SessionStore.append(sessionDir, "usb_props.txt", body);
+                }
+            } catch (Throwable t) {
+                event("WARN", "Не удалось прочитать USB properties", t.getClass().getSimpleName());
+            }
         });
     }
 
-    private String currentCompactState() {
-        return "usb=" + (previousUsbPowered ? "powered" : "off")
-                + ", functions=" + previousUsbState
-                + ", accessory=" + previousAccessory
-                + ", aaPid=" + (previousAaPid.isBlank() ? "none" : previousAaPid);
+    private void captureDeepSnapshot(String reason) {
+        VerifiedShell s = shell;
+        if (s == null || sessionDir == null) {
+            SessionStore.append(sessionDir, "snapshots.txt",
+                    "\n=== " + reason + " " + SessionStore.isoNow() + " ===\n"
+                            + "Enhanced snapshot unavailable; Shizuku shell not verified.\n"
+                            + currentUsbSummary() + "\n" + lockState() + "\n");
+            return;
+        }
+        io.execute(() -> {
+            try {
+                String state = s.exec("/system/bin/getprop", "sys.usb.state");
+                String config = s.exec("/system/bin/getprop", "sys.usb.config");
+                String persist = s.exec("/system/bin/getprop", "persist.sys.usb.config");
+                String usb = s.exec("/system/bin/dumpsys", "usb");
+                String ps = s.exec("/system/bin/ps", "-A");
+                projectionProcessSeen = hasProjectionProcess(ps);
+                String body = "\n=== " + reason + " " + SessionStore.isoNow()
+                        + " elapsed=" + SystemClock.elapsedRealtime() + " ===\n"
+                        + "--- public USB state ---\n" + currentUsbSummary() + "\n"
+                        + "--- lock/screen ---\n" + lockState() + "\n"
+                        + "--- explicit properties ---\n"
+                        + "sys.usb.state=" + state + "\n"
+                        + "sys.usb.config=" + config + "\n"
+                        + "persist.sys.usb.config=" + persist + "\n"
+                        + "--- dumpsys usb ---\n" + usb + "\n"
+                        + "--- Android Auto processes ---\n" + filterGearheadProcesses(ps) + "\n";
+                SessionStore.append(sessionDir, "snapshots.txt", body);
+                publishState();
+            } catch (Throwable t) {
+                event("WARN", "Ошибка расширенного snapshot", t.getClass().getSimpleName() + ": " + t.getMessage());
+            }
+        });
+    }
+
+    private void captureLogcatWindow() {
+        VerifiedShell s = shell;
+        if (!started || s == null || sessionDir == null) return;
+        long from = logCursorMs;
+        long next = System.currentTimeMillis();
+        try {
+            String fromText = logcatTime(from);
+            String out = s.exec(
+                    "/system/bin/logcat",
+                    "-b", "main",
+                    "-b", "system",
+                    "-b", "events",
+                    "-b", "crash",
+                    "-v", "threadtime",
+                    "-v", "year",
+                    "-T", fromText,
+                    "-d");
+            logCursorMs = next;
+            if (out == null || out.isBlank()) return;
+            StringBuilder keep = new StringBuilder();
+            for (String line : out.split("\\R")) {
+                if (!isRelevantLogLine(line)) continue;
+                String safe = Redactor.redact(line);
+                keep.append(safe).append('\n');
+                logSignatureCounts.merge(logSignature(safe), 1, Integer::sum);
+            }
+            if (keep.length() > 0) SessionStore.append(sessionDir, "logcat_filtered.txt", keep.toString());
+        } catch (Throwable t) {
+            SessionStore.append(sessionDir, "logcat_errors.txt",
+                    SessionStore.isoNow() + " " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+    }
+
+    private static boolean isRelevantLogLine(String line) {
+        if (line == null) return false;
+        String l = line.toLowerCase(Locale.ROOT);
+        boolean direct = l.contains("usb") || l.contains("accessory") || l.contains("aoa")
+                || l.contains("gearhead") || l.contains("android auto") || l.contains("androidauto")
+                || l.contains("carservice") || l.contains("car.") || l.contains("car_");
+        if (direct) return true;
+        if (l.contains("projection")) {
+            return l.contains("gearhead") || l.contains("android auto") || l.contains("car");
+        }
+        return false;
+    }
+
+    private static String logSignature(String line) {
+        if (line == null) return "";
+        return line.replaceFirst("^\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}\\.\\d+\\s+\\d+\\s+\\d+\\s+[VDIWEF]\\s+", "")
+                .trim();
+    }
+
+    private static String logcatTime(long millis) {
+        SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US);
+        f.setTimeZone(TimeZone.getDefault());
+        return f.format(new Date(millis));
+    }
+
+    private static boolean hasProjectionProcess(String ps) {
+        if (ps == null) return false;
+        for (String line : ps.split("\\R")) {
+            String l = line.toLowerCase(Locale.ROOT);
+            if (l.contains("com.google.android.projection.gearhead:projection")) return true;
+        }
+        return false;
+    }
+
+    private static String filterGearheadProcesses(String ps) {
+        if (ps == null) return "";
+        StringBuilder out = new StringBuilder();
+        for (String line : ps.split("\\R")) {
+            if (line.toLowerCase(Locale.ROOT).contains("com.google.android.projection.gearhead")) {
+                out.append(line).append('\n');
+            }
+        }
+        return out.length() == 0 ? "none" : out.toString().trim();
+    }
+
+    private void logLockStateIfChanged(String reason) {
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        KeyguardManager km = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        boolean interactive = pm != null && pm.isInteractive();
+        boolean locked = km != null && km.isKeyguardLocked();
+        if (lastInteractive == null || lastKeyguardLocked == null
+                || lastInteractive != interactive || lastKeyguardLocked != locked) {
+            lastInteractive = interactive;
+            lastKeyguardLocked = locked;
+            event("INFO", "Экран/блокировка", reason + ": interactive=" + interactive + ", keyguardLocked=" + locked);
+        }
+    }
+
+    private String lockState() {
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        KeyguardManager km = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        return "interactive=" + (pm != null && pm.isInteractive())
+                + ", keyguardLocked=" + (km != null && km.isKeyguardLocked());
+    }
+
+    private String currentUsbSummary() {
+        return "connected=" + usbConnected
+                + ", configured=" + usbConfigured
+                + ", accessory=" + usbAccessory
+                + ", mtp=" + usbMtp
+                + ", ptp=" + usbPtp
+                + ", adb=" + usbAdb
+                + ", usbPower=" + usbPower;
     }
 
     private void event(String severity, String title, String detail) {
@@ -330,59 +578,117 @@ public class DiagnosticService extends Service {
         sendBroadcast(new Intent(ACTION_EVENT).setPackage(getPackageName())
                 .putExtra("severity", severity)
                 .putExtra("title", title)
-                .putExtra("detail", detail)
+                .putExtra("detail", Redactor.redact(detail))
                 .putExtra("time", System.currentTimeMillis()));
     }
 
-    private void publishState(String main, String usb, String accessory, String aa, String level) {
+    private void publishState() {
+        String main;
+        String level;
+        if (!usbConnected) {
+            main = "Жду подключения кабеля";
+            level = "IDLE";
+        } else if (usbAccessory) {
+            main = "Accessory handshake найден";
+            level = "GOOD";
+        } else if (usbConfigured) {
+            main = "USB configured — жду accessory";
+            level = "INFO";
+        } else {
+            main = "USB подключён — жду configuration";
+            level = "INFO";
+        }
+        String usb = usbStateSeen
+                ? "conn=" + yesNo(usbConnected) + " cfg=" + yesNo(usbConfigured)
+                    + (usbPtp ? " PTP" : "") + (usbMtp ? " MTP" : "") + (usbAdb ? " ADB" : "")
+                : (usbPower ? "питание, USB_STATE нет" : "—");
+        String accessory = usbAccessory ? "активен" : (usbConnected ? "нет" : "—");
+        String aa = projectionProcessSeen ? "projection process" : (usbAccessory ? "accessory signal" : "—");
+
         getSharedPreferences(PREF, MODE_PRIVATE).edit()
                 .putBoolean(KEY_RUNNING, started)
                 .putString(KEY_MAIN_STATUS, main)
                 .putString(KEY_USB, usb)
                 .putString(KEY_ACCESSORY, accessory)
                 .putString(KEY_AA, aa)
-                .putString(KEY_LEVEL, level)
-                .apply();
+                .putString(KEY_LEVEL, level).apply();
         sendBroadcast(new Intent(ACTION_STATE).setPackage(getPackageName())
-                .putExtra("main", main)
-                .putExtra("usb", usb)
-                .putExtra("accessory", accessory)
-                .putExtra("aa", aa)
-                .putExtra("level", level));
+                .putExtra("main", main).putExtra("usb", usb)
+                .putExtra("accessory", accessory).putExtra("aa", aa).putExtra("level", level));
     }
 
+    private static String yesNo(boolean value) { return value ? "1" : "0"; }
+
     private void stopDiagnostics() {
-        if (!started) {
-            stopSelf();
-            return;
-        }
-        event("INFO", "Диагностика остановлена", "Сессия сохранена и готова к экспорту");
-        snapshotNow("session_stop");
+        if (!started) { stopSelf(); return; }
+        event("INFO", "Диагностика остановлена", "Сессия готова к экспорту через SAF");
+        mainHandler.removeCallbacks(stuckCheck);
+        finishAccessoryDuration(SystemClock.elapsedRealtime());
+        writeMetrics();
+        writeLogRepeatStats();
         started = false;
         getSharedPreferences(PREF, MODE_PRIVATE).edit()
                 .putBoolean(KEY_RUNNING, false)
                 .putString(KEY_MAIN_STATUS, "Диагностика остановлена")
-                .putString(KEY_USB, "—")
-                .putString(KEY_ACCESSORY, "—")
-                .putString(KEY_AA, "—")
-                .putString(KEY_LEVEL, "IDLE")
-                .apply();
+                .putString(KEY_USB, "—").putString(KEY_ACCESSORY, "—")
+                .putString(KEY_AA, "—").putString(KEY_LEVEL, "IDLE").apply();
         sendBroadcast(new Intent(ACTION_STATE).setPackage(getPackageName())
-                .putExtra("main", "Диагностика остановлена")
-                .putExtra("usb", "—")
-                .putExtra("accessory", "—")
-                .putExtra("aa", "—")
-                .putExtra("level", "IDLE"));
-        try {
-            if (userServiceArgs != null && Shizuku.pingBinder()) {
-                Shizuku.unbindUserService(userServiceArgs, shellConnection, true);
-            }
-        } catch (Throwable ignored) {}
+                .putExtra("main", "Диагностика остановлена").putExtra("usb", "—")
+                .putExtra("accessory", "—").putExtra("aa", "—").putExtra("level", "IDLE"));
+        if (receiverRegistered) {
+            try { unregisterReceiver(systemReceiver); } catch (Throwable ignored) {}
+            receiverRegistered = false;
+        }
+        safeUnbindShell();
         shell = null;
-        if (scheduler != null) scheduler.shutdown();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
+    }
+
+    private void writeMetrics() {
+        StringBuilder out = new StringBuilder();
+        out.append("attach_count=").append(attachCount).append('\n');
+        out.append("detach_count=").append(detachCount).append('\n');
+        out.append("flap_transitions=").append(attachCount + detachCount).append('\n');
+        out.append("manual_car_marker=").append(carMarked).append('\n');
+        out.append("usb_state_seen=").append(usbStateSeen).append('\n');
+        out.append("wired_adb_seen=").append(wiredAdbSeen).append('\n');
+        out.append("enhanced_shizuku_ever_available=").append(enhancedEverAvailable).append('\n');
+        out.append("attach_to_accessory_ms=").append(joinLongs(attachToAccessoryMs)).append('\n');
+        out.append("accessory_session_ms=").append(joinLongs(accessoryDurationsMs)).append('\n');
+        SessionStore.write(sessionDir, "metrics.txt", out.toString());
+    }
+
+    private void writeLogRepeatStats() {
+        StringBuilder out = new StringBuilder();
+        logSignatureCounts.entrySet().stream()
+                .filter(e -> e.getValue() > 1)
+                .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                .limit(300)
+                .forEach(e -> out.append('×').append(e.getValue()).append(' ').append(e.getKey()).append('\n'));
+        if (out.length() == 0) out.append("No repeated relevant log signatures detected.\n");
+        SessionStore.write(sessionDir, "log_repeat_stats.txt", out.toString());
+    }
+
+    private static String joinLongs(List<Long> values) {
+        if (values.isEmpty()) return "none";
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) b.append(',');
+            b.append(values.get(i));
+        }
+        return b.toString();
+    }
+
+    private void safeUnbindShell() {
+        try {
+            if (userServiceArgs != null && Shizuku.pingBinder()
+                    && ShellIdentityPolicy.isSafeBackendUid(Shizuku.getUid())) {
+                Shizuku.unbindUserService(userServiceArgs, shellConnection, true);
+            }
+        } catch (Throwable ignored) {}
+        bindingShell = false;
     }
 
     private Notification buildNotification() {
@@ -396,7 +702,7 @@ public class DiagnosticService extends Service {
         return new Notification.Builder(this, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle("PCM Link Doctor")
-                .setContentText("Knox-safe USB / Android Auto диагностика")
+                .setContentText("Событийная USB / Android Auto диагностика")
                 .setContentIntent(content)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
@@ -406,88 +712,29 @@ public class DiagnosticService extends Service {
 
     private void createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
-            NotificationChannel c = new NotificationChannel(
-                    CHANNEL_ID, "PCM Link diagnostics", NotificationManager.IMPORTANCE_LOW);
-            c.setDescription("Knox-safe фоновая USB/Android Auto диагностика");
+            NotificationChannel c = new NotificationChannel(CHANNEL_ID,
+                    "PCM Link diagnostics", NotificationManager.IMPORTANCE_LOW);
+            c.setDescription("Read-only USB/Android Auto diagnostics");
             getSystemService(NotificationManager.class).createNotificationChannel(c);
         }
     }
 
-    private static boolean containsToken(String state, String token) {
-        if (state == null) return false;
-        for (String s : state.toLowerCase(Locale.ROOT).split(",")) {
-            if (s.trim().equals(token)) return true;
-        }
-        return false;
-    }
-
     @Override public void onDestroy() {
-        getSharedPreferences(PREF, MODE_PRIVATE).edit().putBoolean(KEY_RUNNING, false).apply();
+        mainHandler.removeCallbacks(stuckCheck);
+        if (receiverRegistered) {
+            try { unregisterReceiver(systemReceiver); } catch (Throwable ignored) {}
+            receiverRegistered = false;
+        }
+        safeUnbindShell();
+        shell = null;
+        Shizuku.removeBinderReceivedListener(binderReceivedListener);
+        Shizuku.removeBinderDeadListener(binderDeadListener);
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
-        if (scheduler != null && !scheduler.isShutdown()) scheduler.shutdownNow();
+        io.shutdownNow();
+        logScheduler.shutdownNow();
+        getSharedPreferences(PREF, MODE_PRIVATE).edit().putBoolean(KEY_RUNNING, false).apply();
         super.onDestroy();
     }
 
-    @Override public IBinder onBind(Intent intent) {
-        return null;
-    }
-
-    static final class Parsed {
-        final String usbState;
-        final String usbConfig;
-        final boolean usbPowered;
-        final boolean accessory;
-        final String aaPid;
-
-        Parsed(String usbState, String usbConfig, boolean usbPowered, boolean accessory, String aaPid) {
-            this.usbState = usbState;
-            this.usbConfig = usbConfig;
-            this.usbPowered = usbPowered;
-            this.accessory = accessory;
-            this.aaPid = aaPid;
-        }
-
-        static Parsed from(String raw) {
-            String state = sectionFirst(raw, "__STATE__", "__CONFIG__");
-            String config = sectionFirst(raw, "__CONFIG__", "__BATTERY__");
-            String battery = section(raw, "__BATTERY__", "__USB__");
-            String usb = section(raw, "__USB__", "__AA_PID__");
-            String pid = sectionFirst(raw, "__AA_PID__", null);
-            String lowBattery = battery.toLowerCase(Locale.ROOT);
-            boolean powered = lowBattery.contains("usb powered: true")
-                    || lowBattery.contains("usb powered=true");
-            boolean accessory = containsToken(state, "accessory") || looksLikeCurrentAccessory(usb);
-            return new Parsed(state.trim(), config.trim(), powered, accessory, pid.trim());
-        }
-
-        private static boolean looksLikeCurrentAccessory(String usb) {
-            for (String line : usb.split("\\R")) {
-                String l = line.toLowerCase(Locale.ROOT);
-                if (l.contains("accessory")
-                        && (l.contains("current") || l.contains("function"))
-                        && !l.contains("supported")) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        private static String sectionFirst(String raw, String start, String end) {
-            String s = section(raw, start, end);
-            for (String line : s.split("\\R")) {
-                if (!line.trim().isEmpty()) return line.trim();
-            }
-            return "";
-        }
-
-        private static String section(String raw, String start, String end) {
-            if (raw == null) return "";
-            int a = raw.indexOf(start);
-            if (a < 0) return "";
-            a += start.length();
-            int b = end == null ? raw.length() : raw.indexOf(end, a);
-            if (b < 0) b = raw.length();
-            return raw.substring(a, b).trim();
-        }
-    }
+    @Override public IBinder onBind(Intent intent) { return null; }
 }

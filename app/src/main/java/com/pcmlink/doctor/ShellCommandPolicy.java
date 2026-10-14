@@ -49,7 +49,7 @@ public final class ShellCommandPolicy {
     }
 
     private static boolean isAllowedLogcat(String[] a) {
-        if (a.length != 17) return false;
+        if (a.length != 16) return false;
         return LOGCAT.equals(a[0])
                 && "-b".equals(a[1]) && "main".equals(a[2])
                 && "-b".equals(a[3]) && "system".equals(a[4])
@@ -58,8 +58,7 @@ public final class ShellCommandPolicy {
                 && "-v".equals(a[9]) && "threadtime".equals(a[10])
                 && "-v".equals(a[11]) && "year".equals(a[12])
                 && "-T".equals(a[13]) && LOGCAT_TIME.matcher(a[14]).matches()
-                && "-d".equals(a[15])
-                && "-t".equals(a[16]) == false;
+                && "-d".equals(a[15]);
     }
 
     public static void requireAllowed(String[] argv) {

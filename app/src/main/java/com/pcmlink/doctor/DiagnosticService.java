@@ -332,7 +332,7 @@ public class DiagnosticService extends Service {
         PendingIntent stopPi = PendingIntent.getService(this, 2, stop, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification.Action stopAction = new Notification.Action.Builder(0, "Остановить", stopPi).build();
         return new Notification.Builder(this, CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_data_usb)
+                .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle("PCM Link Doctor")
                 .setContentText("Идёт запись USB / Android Auto диагностики")
                 .setContentIntent(content).setOngoing(true).setOnlyAlertOnce(true)

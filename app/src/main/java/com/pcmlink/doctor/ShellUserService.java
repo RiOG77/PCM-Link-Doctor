@@ -10,12 +10,28 @@ import java.util.concurrent.TimeUnit;
 
 public class ShellUserService extends IRemoteShell.Stub {
     private static final int MAX_OUTPUT_CHARS = 450_000;
+    private static final int SAFE_SHELL_UID = 2000;
 
-    public ShellUserService() {}
-    public ShellUserService(Context context) {}
+    public ShellUserService() {
+        enforceSafeUid();
+    }
+
+    public ShellUserService(Context context) {
+        enforceSafeUid();
+    }
+
+    private static void enforceSafeUid() {
+        int uid = Os.getuid();
+        if (uid != SAFE_SHELL_UID) {
+            throw new SecurityException(
+                    "PCM Link Doctor Knox-safe policy: refusing Shizuku uid=" + uid
+                            + "; only Android shell uid=2000 is allowed");
+        }
+    }
 
     @Override
     public String exec(String command) {
+        enforceSafeUid();
         if (command == null || command.isBlank()) return "";
         Process process = null;
         try {
@@ -39,6 +55,8 @@ public class ShellUserService extends IRemoteShell.Stub {
                 return out + "\n[command timeout]";
             }
             return out.toString().trim();
+        } catch (SecurityException securityException) {
+            throw securityException;
         } catch (Throwable t) {
             return "[exec error] " + t.getClass().getSimpleName() + ": " + t.getMessage();
         } finally {

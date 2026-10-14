@@ -12,13 +12,8 @@ public class ShellUserService extends IRemoteShell.Stub {
     private static final int MAX_OUTPUT_CHARS = 450_000;
     private static final int SAFE_SHELL_UID = 2000;
 
-    public ShellUserService() {
-        enforceSafeUid();
-    }
-
-    public ShellUserService(Context context) {
-        enforceSafeUid();
-    }
+    public ShellUserService() {}
+    public ShellUserService(Context context) {}
 
     private static void enforceSafeUid() {
         int uid = Os.getuid();

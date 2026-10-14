@@ -4,33 +4,36 @@ import android.content.Context;
 import android.system.Os;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 
 public class ShellUserService extends IRemoteShell.Stub {
-    private static final int MAX_OUTPUT_CHARS = 450_000;
-    private static final int SAFE_SHELL_UID = 2000;
+    private static final int MAX_OUTPUT_CHARS = 500_000;
 
-    public ShellUserService() {}
-    public ShellUserService(Context context) {}
+    public ShellUserService() { enforceIdentity(); }
+    public ShellUserService(Context context) { enforceIdentity(); }
 
-    private static void enforceSafeUid() {
+    private static void enforceIdentity() {
         int uid = Os.getuid();
-        if (uid != SAFE_SHELL_UID) {
+        String context = readSelinuxContext();
+        if (!ShellIdentityPolicy.isSafeUserService(uid, context)) {
             throw new SecurityException(
-                    "PCM Link Doctor Knox-safe policy: refusing Shizuku uid=" + uid
-                            + "; only Android shell uid=2000 is allowed");
+                    "PCM Link Doctor Knox-safe policy: refusing uid=" + uid
+                            + " context=" + ShellIdentityPolicy.normalize(context));
         }
     }
 
     @Override
-    public String exec(String command) {
-        enforceSafeUid();
-        if (command == null || command.isBlank()) return "";
+    public String exec(String[] argv) {
+        enforceIdentity();
+        ShellCommandPolicy.requireAllowed(argv);
+
         Process process = null;
         try {
-            process = new ProcessBuilder("/system/bin/sh", "-c", command)
+            process = new ProcessBuilder(argv)
                     .redirectErrorStream(true)
                     .start();
             StringBuilder out = new StringBuilder();
@@ -45,8 +48,8 @@ public class ShellUserService extends IRemoteShell.Stub {
                     out.append(line).append('\n');
                 }
             }
-            if (!process.waitFor(7, TimeUnit.SECONDS)) {
-                process.destroy();
+            if (!process.waitFor(8, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
                 return out + "\n[command timeout]";
             }
             return out.toString().trim();
@@ -60,5 +63,16 @@ public class ShellUserService extends IRemoteShell.Stub {
     }
 
     @Override public int uid() { return Os.getuid(); }
+    @Override public String selinuxContext() { return ShellIdentityPolicy.normalize(readSelinuxContext()); }
     @Override public void destroy() { System.exit(0); }
+
+    private static String readSelinuxContext() {
+        File file = new File("/proc/self/attr/current");
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            String line = reader.readLine();
+            return line == null ? "" : line;
+        } catch (Throwable t) {
+            return "";
+        }
+    }
 }

@@ -1,21 +1,37 @@
-# PCM Link Doctor — техническое задание 1.1
+# PCM Link Doctor — техническое задание 1.2
 
-Целевая реализация: **v0.2.0 Knox-safe**.
+Целевая реализация: **v0.2.1 Knox-safe**.
 
 ## 1. Цель
 
-Диагностировать нестабильный проводной Android Auto в связке Samsung Galaxy → USB → Porsche PCM и доказуемо отделять:
+Диагностировать нестабильный проводной Android Auto в связке Samsung Galaxy → USB → Porsche PCM и отделять:
 
 - физическое USB-подключение;
-- USB configured;
+- `configured`;
 - MTP/PTP;
 - Android Open Accessory / `accessory`;
-- признаки активной Android Auto projection;
-- повторную USB-инициализацию после ручного PTP.
+- повторную USB-инициализацию;
+- влияние ADB/Shizuku на наблюдаемый кейс.
 
 Приложение только наблюдает. Автоматическое изменение USB, Android Auto, Bluetooth, PCM или системных настроек запрещено.
 
-## 2. Knox / boot-chain ограничения
+## 2. Подтверждённый полевой паттерн
+
+На двух чистых сессиях без Shizuku и `adb` подтверждено:
+
+```text
+connected=true
+configured=true
+accessory=false длительное время
+→ ручной PTP
+→ configured drop/re-enumeration
+→ accessory=true через ~2.1–2.2 s
+→ Android Auto работает
+```
+
+v0.2.1 должна собирать максимум данных именно вокруг этого перехода без включения USB debugging.
+
+## 3. Knox / boot-chain ограничения
 
 Запрещены:
 
@@ -29,13 +45,192 @@
 - write в `/system`, `/vendor`, `/sys`, `/proc`;
 - системные settings/property write.
 
-Shizuku допускается только в ADB shell mode через Wireless debugging.
+## 4. Clean base mode
 
-## 3. Identity gate Shizuku
+Base mode — режим по умолчанию.
+
+При обычном запуске:
+
+- Shizuku не bind-ится;
+- Shizuku permission не запрашивается;
+- shell-команды не выполняются;
+- `dumpsys` не выполняется;
+- logcat не читается;
+- USB mode не меняется.
+
+Enhanced mode включается только отдельным пользовательским действием и не используется для чистого Porsche-теста.
+
+## 5. Базовые USB-сигналы
+
+Основной сигнал:
+
+```text
+android.hardware.usb.action.USB_STATE
+```
+
+Также слушать read-only:
+
+```text
+UsbManager.ACTION_USB_ACCESSORY_ATTACHED
+UsbManager.ACTION_USB_ACCESSORY_DETACHED
+UsbManager.ACTION_USB_DEVICE_ATTACHED
+UsbManager.ACTION_USB_DEVICE_DETACHED
+android.hardware.usb.action.USB_PORT_CHANGED
+Intent.ACTION_BATTERY_CHANGED
+SCREEN_ON / SCREEN_OFF / USER_PRESENT
+```
+
+Если конкретный broadcast Samsung/Android не доставляет обычному приложению — это допустимо; отсутствие события не должно ломать сессию.
+
+## 6. Полный USB_STATE event log
+
+Каждый полученный `USB_STATE` пишется в `usb_state_events.txt`, даже если состояние совпадает с предыдущим.
+
+Обязательные поля:
+
+```text
+seq
+wall
+iso
+elapsed
+elapsed_nanos
+delta_prev_ms
+source
+extras
+```
+
+`source` различает обычную доставку и initial sticky intent.
+
+Минимально парсятся extras:
+
+```text
+connected
+configured
+accessory
+mtp
+ptp
+adb
+```
+
+Дополнительно сохраняются все безопасно сериализуемые primitive/string extras, чтобы не потерять Samsung-specific сигналы.
+
+Parcelable/opaque объекты не сериализуются целиком; пишется только имя класса.
+
+## 7. Handshake checkpoints
+
+После каждого перехода `configured=false → true` ставятся пассивные таймеры:
+
+```text
+2 s
+5 s
+10 s
+30 s
+```
+
+Если на checkpoint всё ещё:
+
+```text
+connected=true
+configured=true
+accessory=false
+```
+
+запись идёт в `handshake_checkpoints.txt`.
+
+На 10 s дополнительно фиксируется stuck handshake.
+
+Таймеры не выполняют системных USB-запросов.
+
+## 8. Re-enumeration metrics
+
+Считать:
+
+- `configured_rise_count`;
+- `configured_drop_while_connected_count`;
+- `reenumeration_count`;
+- `stuck_handshake_count`;
+- `initial_config_to_accessory_ms`;
+- `last_config_to_accessory_ms`;
+- `ptp_to_config_drop_ms`;
+- `ptp_to_accessory_ms`;
+- `config_drop_to_accessory_ms`.
+
+## 9. Автоматическая классификация
+
+Классификатор `HandshakeForensics` должен выставлять:
+
+```text
+PTP_REENUMERATION_RECOVERS_AOA
+```
+
+если в одной физической USB-сессии выполнено:
+
+1. ранее был stuck `configured && !accessory`;
+2. появился PTP;
+3. после PTP был `configured` drop;
+4. `accessory=true` появился не позднее 5 s после PTP.
+
+Если был stuck, но recovery-паттерн не подтверждён:
+
+```text
+CONFIGURED_WITHOUT_ACCESSORY
+```
+
+Иначе:
+
+```text
+NO_STUCK_PATTERN
+```
+
+Результат пишется в `findings.txt`.
+
+## 10. Clean / dirty marker
+
+В `findings.txt` и `metrics.txt` писать:
+
+```text
+clean_base_case=true/false
+```
+
+`true` допускается только если:
+
+- `wired_adb_seen=false`;
+- verified enhanced Shizuku реально не использовался.
+
+Если `adb=true` появился в проводном USB_STATE, кейс считается dirty независимо от дальнейшего результата Android Auto.
+
+## 11. Accessory metadata
+
+`UsbManager.getAccessoryList()` разрешено вызывать только после того, как `accessory=true` уже зафиксирован либо пришёл `ACTION_USB_ACCESSORY_ATTACHED`.
+
+Сохранять в `accessory_info.txt`:
+
+- manufacturer;
+- model;
+- description;
+- version;
+- URI после redaction.
+
+Serial не сохранять.
+
+## 12. Observer effect
+
+В base mode запрещены:
+
+- USB polling;
+- `dumpsys usb`;
+- Shizuku bind;
+- logcat;
+- Package usage/process probing;
+- любые writes.
+
+Локальная запись файлов и внутренние Handler timers допустимы.
+
+## 13. Enhanced Shizuku — только opt-in
+
+После явного пользовательского действия:
 
 ### До bind
-
-Перед `Shizuku.bindUserService()` обязательно:
 
 ```java
 Shizuku.getUid() == 2000
@@ -45,8 +240,6 @@ Shizuku.getUid() == 2000
 
 ### После bind
 
-UserService должен подтвердить одновременно:
-
 ```text
 uid=2000
 SELinux=u:r:shell:s0
@@ -54,11 +247,9 @@ SELinux=u:r:shell:s0
 
 Только после этого создаётся `VerifiedShell`.
 
-Диагностический код не должен принимать raw `IRemoteShell` как рабочий shell-интерфейс.
+При новом binder identity проверяется заново.
 
-При каждом новом `onBinderReceived` backend identity проверяется заново. Потеря Shizuku не останавливает базовую диагностику.
-
-## 4. Shell API
+## 14. Shell API
 
 AIDL:
 
@@ -68,16 +259,16 @@ int uid()
 String selinuxContext()
 ```
 
-Строкового `exec("...")` и `sh -c` быть не должно.
+`sh -c` и строковый arbitrary shell запрещены.
 
-`ShellUserService` обязан:
+`ShellUserService`:
 
-1. проверить UID + SELinux;
-2. вызвать `ShellCommandPolicy.requireAllowed(argv)`;
-3. выполнить `new ProcessBuilder(argv)`;
-4. не использовать shell parser.
+1. проверяет UID + SELinux;
+2. вызывает `ShellCommandPolicy.requireAllowed(argv)`;
+3. запускает `new ProcessBuilder(argv)`;
+4. не использует shell parser.
 
-## 5. Exact argv allowlist
+## 15. Exact argv allowlist enhanced mode
 
 Разрешены только:
 
@@ -89,7 +280,7 @@ String selinuxContext()
 /system/bin/ps -A
 ```
 
-и фиксированный read-only `logcat`:
+и фиксированный read-only logcat:
 
 ```text
 /system/bin/logcat
@@ -103,154 +294,29 @@ String selinuxContext()
 -d
 ```
 
-Запрещены любые другие executable, flags или arguments.
+Запрещены любые другие executable/flags/arguments.
 
-В частности должны отклоняться:
-
-```text
-sh -c
-dumpsys battery unplug
-dumpsys battery reset
-logcat -c
-logcat -f
-setprop
-settings put/delete
-pm grant/revoke
-mount/umount
-reboot
-setenforce
-```
-
-## 6. Базовый режим без Shizuku
-
-Приложение обязано сохранять полезность без Shizuku.
-
-Основные сигналы:
-
-```text
-android.hardware.usb.action.USB_STATE
-UsbManager.ACTION_USB_ACCESSORY_ATTACHED
-UsbManager.ACTION_USB_ACCESSORY_DETACHED
-Intent.ACTION_BATTERY_CHANGED
-SCREEN_ON / SCREEN_OFF / USER_PRESENT
-```
-
-`USB_STATE` используется как основной тайминг-сигнал и читается через dynamic receiver.
-
-Минимальные extras:
-
-```text
-connected
-configured
-accessory
-mtp
-ptp
-adb
-```
-
-Потеря Shizuku пишется в timeline отдельным событием, но базовая сессия продолжается.
-
-## 7. Observer effect
-
-Постоянный polling `dumpsys usb` запрещён.
-
-`dumpsys usb` выполняется только после события или ручной метки:
-
-- stuck handshake;
-- accessory stable;
-- accessory attached;
-- `AA не запустился`;
-- `После PTP заработало`.
-
-Если в `USB_STATE` обнаружен `adb=true`, пишется предупреждение, что проводной ADB меняет USB function set. Для Shizuku в тесте используется Wireless debugging.
-
-## 8. Stuck handshake
-
-Таймер начинается только после состояния:
-
-```text
-connected=true
-configured=true
-accessory=false
-```
-
-Если через 10 секунд accessory не появился — событие `Возможен зависший handshake`.
-
-`USB powered=true` не запускает handshake timer.
-
-Пользователь может поставить ручную метку `Подключил к авто`.
-
-## 9. Timing
-
-Каждое timeline-событие хранит:
-
-- wall-clock epoch;
-- `SystemClock.elapsedRealtime()`.
-
-Метрики:
-
-- attach count;
-- detach count;
-- flap transitions;
-- attach → accessory, ms;
-- PTP → accessory, ms;
-- accessory session duration, ms.
-
-## 10. Android Auto
+## 16. Android Auto
 
 Основной процесс `com.google.android.projection.gearhead` сам по себе не считается доказательством проекции.
 
-Enhanced snapshot отдельно ищет:
+Только enhanced snapshot может искать:
 
 ```text
 com.google.android.projection.gearhead:projection
 ```
 
-Logcat-фильтр оставляет USB/AOA/gearhead/Android Auto/CAR-сигналы. Строки с общим `projection` без AA/car-контекста не сохраняются, чтобы не ловить MediaProjection.
+Base mode не должен использовать process probing.
 
-В manifest должен быть `<queries>` для `com.google.android.projection.gearhead`.
+## 17. Privacy
 
-## 11. Samsung context
+До записи применяется redaction для:
 
-Фиксировать:
-
-- screen interactive;
-- keyguard locked;
-- `persist.sys.usb.config` при verified Shizuku;
-- `sys.usb.state`;
-- `sys.usb.config`;
-- Type-C power/data roles из event-triggered `dumpsys usb`;
-- наличие `adb` в USB functions.
-
-Auto Blocker не переключать и не читать через private settings. Его состояние при необходимости добавляется в анализ вручную.
-
-## 12. Logcat
-
-Буферы:
-
-```text
-main
-system
-events
-crash
-```
-
-Использовать временной курсор `-T`, не очищать logcat, не писать через `-f`.
-
-Повторяющиеся строки не удалять. Дополнительно вести агрегированную статистику повторов `×N` в `log_repeat_stats.txt`.
-
-## 13. Privacy
-
-До записи в диагностические файлы применяется redaction для:
-
-- MAC;
-- BSSID;
+- MAC/BSSID;
 - quoted SSID;
 - IPv4;
 - email;
 - serial-like values.
-
-Полный `getprop` запрещён.
 
 Приложение не объявляет `INTERNET`.
 
@@ -260,11 +326,11 @@ crash
 
 ```text
 allowBackup=false
-dataExtractionRules=<exclude diagnostics>
 usesCleartextTraffic=false
+dataExtractionRules=<exclude diagnostics>
 ```
 
-## 14. Foreground Service
+## 18. Foreground Service
 
 Для targetSdk 36:
 
@@ -281,13 +347,9 @@ Service:
 foregroundServiceType="specialUse"
 ```
 
-с явно описанным subtype.
+Partial wakelock только на время пользовательской сессии.
 
-Partial wakelock используется только на время пользовательской диагностической сессии.
-
-## 15. Export
-
-ZIP формируется локально и сохраняется пользователем через SAF.
+## 19. ZIP v0.2.1
 
 Ожидаемые файлы:
 
@@ -295,17 +357,28 @@ ZIP формируется локально и сохраняется польз
 device.txt
 timeline.txt
 raw_usb.txt
-usb_props.txt
-snapshots.txt
-logcat_filtered.txt
-log_repeat_stats.txt
+usb_state_events.txt
+usb_aux_events.txt
+handshake_checkpoints.txt
+accessory_info.txt
+findings.txt
 metrics.txt
-shell_identity.txt (если enhanced mode был доступен)
+snapshots.txt
+log_repeat_stats.txt
+usb_props.txt          (enhanced only)
+logcat_filtered.txt    (enhanced only)
+shell_identity.txt     (enhanced only)
 ```
 
-`raw_usb.txt` пишется только при изменении fingerprint USB-состояния.
+## 20. Unit tests
 
-## 16. Build
+Кроме security-тестов обязательны тесты `HandshakeForensics`:
+
+- stuck + PTP + config drop + accessory <=5 s → `PTP_REENUMERATION_RECOVERS_AOA`;
+- stuck + accessory без PTP → не классифицировать как PTP recovery;
+- ADB или enhanced Shizuku → `clean_base_case=false`.
+
+## 21. Build / CI
 
 ```text
 JDK 17
@@ -314,98 +387,56 @@ Android Gradle Plugin 8.13.0
 compileSdk 36
 targetSdk 36
 minSdk 29
+versionCode 4
+versionName 0.2.1
 ```
 
-Сборка и тесты CI только через committed wrapper:
+CI:
 
 ```bash
+bash scripts/ci_safety_check.sh
 ./gradlew --no-daemon :app:testDebugUnitTest
 ./gradlew --no-daemon :app:assembleDebug
-```
-
-## 17. CI security gates
-
-CI обязан падать при обнаружении:
-
-- `sh -c` / arbitrary shell;
-- mutating command literals;
-- `INTERNET`;
-- storage permissions;
-- `REQUEST_INSTALL_PACKAGES`;
-- `WRITE_SECURE_SETTINGS`;
-- `PACKAGE_USAGE_STATS`;
-- accessibility/VPN components.
-
-После сборки запускается:
-
-```text
 aapt2 dump permissions <apk>
 ```
 
-и проверяется фактический merged APK, а не только исходный manifest.
+CI падает при появлении arbitrary shell, mutating shell literals, INTERNET/storage/install-packages/secure-settings/usage-stats permissions, accessibility/VPN components.
 
-## 18. Unit tests
+## 22. Acceptance Criteria
 
-Минимальный обязательный набор:
+v0.2.1 допускается к полевому тесту, если:
 
-- fake `IRemoteShell`, uid=0 → `VerifiedShell.verify()` отказ;
-- uid=2000 + wrong SELinux → отказ;
-- uid=2000 + `u:r:shell:s0` → допуск;
-- `sh -c` → отказ;
-- `dumpsys battery unplug/reset` → отказ;
-- `logcat -c/-f` → отказ;
-- unknown getprop → отказ;
-- неизвестный executable → отказ;
-- разрешённые argv → допуск.
+1. обычный старт не bind-ит Shizuku;
+2. base mode не выполняет shell/logcat/dumpsys;
+3. каждый USB_STATE сохраняется отдельно;
+4. primitive/string extras сохраняются, opaque parcelables не дампятся;
+5. checkpoints 2/5/10/30 s не делают системных USB-запросов;
+6. PTP re-enumeration classifier покрыт unit-тестами;
+7. ADB автоматически делает кейс dirty;
+8. accessory metadata читается только после появления accessory;
+9. root/non-shell Shizuku блокируется до bind;
+10. arbitrary shell отсутствует;
+11. `INTERNET` и storage permissions отсутствуют в APK;
+12. CI safety, unit tests, assembleDebug и permission check зелёные.
 
-## 19. A/B observer-effect acceptance
+## 23. Полевой сценарий
 
-Перед признанием диагностики готовой к регулярному использованию провести на одном телефоне/авто минимум два набора повторов:
+Для чистого Porsche-теста:
 
-**A:** только базовый событийный режим, без Shizuku enhanced snapshot.
+```text
+USB debugging OFF
+Wireless debugging OFF
+Shizuku не нужен
+```
 
-**B:** событийный режим + verified Shizuku, event-triggered snapshots/logcat.
+Порядок:
 
-Сравнить:
-
-- долю успешных автоматических handshake;
-- attach→accessory;
-- число attach/detach;
-- частоту необходимости PTP.
-
-Если режим B статистически/повторяемо меняет поведение handshake относительно A, enhanced mode считать влияющим на объект диагностики и выключить по умолчанию.
-
-## 20. Acceptance Criteria
-
-Релиз допускается к тесту на Samsung только если:
-
-1. root/не-shell Shizuku блокируется до `bindUserService`;
-2. UserService дополнительно проверяет uid=2000 + `u:r:shell:s0`;
-3. arbitrary shell отсутствует;
-4. argv allowlist покрыт unit-тестами;
-5. USB primary path event-driven;
-6. `dumpsys usb` не поллится во время handshake;
-7. stuck timer стартует от connected+configured;
-8. базовый режим работает без Shizuku;
-9. `INTERNET` и storage permissions отсутствуют в собранном APK;
-10. экспорт идёт через SAF;
-11. backup диагностических данных запрещён;
-12. privacy redaction применяется до записи;
-13. CI safety policy, unit tests, APK build и permission check зелёные;
-14. Gradle Wrapper закоммичен и CI использует `./gradlew`;
-15. проведён отдельный A/B тест observer effect перед выводами по автомобилю.
-
-## 21. Что отдать на повторный review
-
-- `README.md`;
-- этот `TECH_SPEC.md`;
-- `ShellCommandPolicy.java`;
-- `ShellIdentityPolicy.java`;
-- `VerifiedShell.java`;
-- `ShellUserService.java`;
-- `DiagnosticService.java`;
-- `AndroidManifest.xml`;
-- unit tests;
-- `scripts/ci_safety_check.sh`;
-- `.github/workflows/build-apk.yml`;
-- APK и SHA-256.
+1. открыть PCM Link Doctor;
+2. начать диагностику до подключения кабеля;
+3. подключить Porsche PCM;
+4. нажать `Подключил к авто`;
+5. при провале — `AA не запустился`;
+6. вручную выбрать PTP;
+7. после запуска AA — `После PTP заработало`;
+8. остановить;
+9. экспортировать ZIP.

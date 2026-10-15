@@ -63,7 +63,8 @@ public class MainActivity extends Activity {
         if (requestCode != SHIZUKU_REQUEST) return;
         refreshShizuku();
         if (grantResult == PackageManager.PERMISSION_GRANTED && isRunning()) {
-            startService(new Intent(this, DiagnosticService.class).setAction(DiagnosticService.ACTION_START));
+            startService(new Intent(this, DiagnosticService.class)
+                    .setAction(DiagnosticService.ACTION_ENABLE_ENHANCED));
         }
     };
 
@@ -71,7 +72,8 @@ public class MainActivity extends Activity {
         @Override public void onReceive(Context context, Intent intent) {
             if (DiagnosticService.ACTION_STATE.equals(intent.getAction())) {
                 updateState(intent.getStringExtra("main"), intent.getStringExtra("usb"),
-                        intent.getStringExtra("accessory"), intent.getStringExtra("aa"), intent.getStringExtra("level"));
+                        intent.getStringExtra("accessory"), intent.getStringExtra("aa"),
+                        intent.getStringExtra("level"));
                 refreshRunningUi();
             } else if (DiagnosticService.ACTION_EVENT.equals(intent.getAction())) {
                 addEvent(intent.getLongExtra("time", System.currentTimeMillis()),
@@ -91,8 +93,11 @@ public class MainActivity extends Activity {
         IntentFilter filter = new IntentFilter();
         filter.addAction(DiagnosticService.ACTION_STATE);
         filter.addAction(DiagnosticService.ACTION_EVENT);
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(diagnosticReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
-        else registerReceiver(diagnosticReceiver, filter);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(diagnosticReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(diagnosticReceiver, filter);
+        }
 
         Shizuku.addRequestPermissionResultListener(permissionListener);
         loadPersistedState();
@@ -127,12 +132,15 @@ public class MainActivity extends Activity {
         root.addView(top);
 
         TextView title = text("Поймаем, где ломается\nAndroid Auto", 31, C_TEXT, true);
-        LinearLayout.LayoutParams titleLp = lp(-1, -2); titleLp.topMargin = dp(18);
+        LinearLayout.LayoutParams titleLp = lp(-1, -2);
+        titleLp.topMargin = dp(18);
         root.addView(title, titleLp);
 
-        TextView sub = text("Samsung ↔ USB ↔ Porsche PCM. Событийный базовый режим работает даже без Shizuku и ничего не меняет в USB.", 14, C_MUTED, false);
+        TextView sub = text("Samsung ↔ USB ↔ Porsche PCM. Чистый базовый режим ничего не меняет в USB и не включает Shizuku автоматически.", 14, C_MUTED, false);
         sub.setLineSpacing(0, 1.2f);
-        LinearLayout.LayoutParams subLp = lp(-1, -2); subLp.topMargin = dp(10); subLp.bottomMargin = dp(18);
+        LinearLayout.LayoutParams subLp = lp(-1, -2);
+        subLp.topMargin = dp(10);
+        subLp.bottomMargin = dp(18);
         root.addView(sub, subLp);
 
         LinearLayout statusCard = column();
@@ -149,11 +157,13 @@ public class MainActivity extends Activity {
         statusCard.addView(statusHead);
 
         statusHint = text("Запусти диагностику до подключения кабеля.", 13, C_MUTED, false);
-        LinearLayout.LayoutParams hintLp = lp(-1, -2); hintLp.topMargin = dp(8);
+        LinearLayout.LayoutParams hintLp = lp(-1, -2);
+        hintLp.topMargin = dp(8);
         statusCard.addView(statusHint, hintLp);
 
         LinearLayout chips = row();
-        LinearLayout.LayoutParams chipsLp = lp(-1, -2); chipsLp.topMargin = dp(16);
+        LinearLayout.LayoutParams chipsLp = lp(-1, -2);
+        chipsLp.topMargin = dp(16);
         statusCard.addView(chips, chipsLp);
         usbValue = addStatusChip(chips, "USB");
         accessoryValue = addStatusChip(chips, "ACCESSORY");
@@ -163,17 +173,21 @@ public class MainActivity extends Activity {
         shizukuStatus.setPadding(dp(14), dp(12), dp(14), dp(12));
         shizukuStatus.setBackground(round(C_CARD_2, 14, C_LINE, 1));
         shizukuStatus.setOnClickListener(v -> onShizukuClick());
-        LinearLayout.LayoutParams shLp = lp(-1, -2); shLp.topMargin = dp(12);
+        LinearLayout.LayoutParams shLp = lp(-1, -2);
+        shLp.topMargin = dp(12);
         root.addView(shizukuStatus, shLp);
 
         startStopButton = button("Начать диагностику", C_INFO, Color.rgb(7, 17, 32));
         startStopButton.setOnClickListener(v -> onStartStop());
-        LinearLayout.LayoutParams startLp = lp(-1, dp(56)); startLp.topMargin = dp(16);
+        LinearLayout.LayoutParams startLp = lp(-1, dp(56));
+        startLp.topMargin = dp(16);
         root.addView(startStopButton, startLp);
 
         TextView markerTitle = text("МЕТКИ ВО ВРЕМЯ ТЕСТА", 12, C_MUTED, true);
         markerTitle.setLetterSpacing(0.08f);
-        LinearLayout.LayoutParams mtLp = lp(-1, -2); mtLp.topMargin = dp(24); mtLp.bottomMargin = dp(10);
+        LinearLayout.LayoutParams mtLp = lp(-1, -2);
+        mtLp.topMargin = dp(24);
+        mtLp.bottomMargin = dp(10);
         root.addView(markerTitle, mtLp);
 
         markCarButton = button("Подключил к авто", C_CARD_2, C_INFO);
@@ -181,23 +195,29 @@ public class MainActivity extends Activity {
         root.addView(markCarButton, lp(-1, dp(48)));
 
         LinearLayout markers = row();
-        LinearLayout.LayoutParams markersLp = lp(-1, dp(62)); markersLp.topMargin = dp(10);
+        LinearLayout.LayoutParams markersLp = lp(-1, dp(62));
+        markersLp.topMargin = dp(10);
         root.addView(markers, markersLp);
+
         markFailedButton = button("AA не\nзапустился", Color.rgb(55, 24, 29), C_BAD);
         markFailedButton.setTextSize(13);
         markFailedButton.setOnClickListener(v -> sendMarker(DiagnosticService.ACTION_MARK_FAILED));
-        LinearLayout.LayoutParams badLp = weight(0, -1, 1); badLp.rightMargin = dp(6);
+        LinearLayout.LayoutParams badLp = weight(0, -1, 1);
+        badLp.rightMargin = dp(6);
         markers.addView(markFailedButton, badLp);
 
         markRecoveredButton = button("После PTP\nзаработало", Color.rgb(20, 47, 36), C_OK);
         markRecoveredButton.setTextSize(13);
         markRecoveredButton.setOnClickListener(v -> sendMarker(DiagnosticService.ACTION_MARK_RECOVERED));
-        LinearLayout.LayoutParams goodLp = weight(0, -1, 1); goodLp.leftMargin = dp(6);
+        LinearLayout.LayoutParams goodLp = weight(0, -1, 1);
+        goodLp.leftMargin = dp(6);
         markers.addView(markRecoveredButton, goodLp);
 
         LinearLayout timelineHead = row();
         timelineHead.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams thLp = lp(-1, -2); thLp.topMargin = dp(26); thLp.bottomMargin = dp(10);
+        LinearLayout.LayoutParams thLp = lp(-1, -2);
+        thLp.topMargin = dp(26);
+        thLp.bottomMargin = dp(10);
         root.addView(timelineHead, thLp);
         TextView timelineTitle = text("ПОСЛЕДНИЕ СОБЫТИЯ", 12, C_MUTED, true);
         timelineTitle.setLetterSpacing(0.08f);
@@ -216,9 +236,10 @@ public class MainActivity extends Activity {
         empty.setPadding(dp(8), dp(24), dp(8), dp(24));
         eventContainer.addView(empty, lp(-1, -2));
 
-        TextView safety = text("KNOX-SAFE  •  без root / OEM Unlock  •  Shizuku только uid=2000 + u:r:shell:s0  •  без INTERNET permission", 11, C_MUTED, false);
+        TextView safety = text("KNOX-SAFE  •  base mode без ADB/Shizuku  •  enhanced только вручную  •  без INTERNET permission", 11, C_MUTED, false);
         safety.setLineSpacing(0, 1.2f);
-        LinearLayout.LayoutParams safetyLp = lp(-1, -2); safetyLp.topMargin = dp(18);
+        LinearLayout.LayoutParams safetyLp = lp(-1, -2);
+        safetyLp.topMargin = dp(18);
         root.addView(safety, safetyLp);
 
         return scroll;
@@ -236,7 +257,8 @@ public class MainActivity extends Activity {
         chip.addView(l, lp(-1, -2));
         TextView v = text("—", 11, C_TEXT, true);
         v.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams vLp = lp(-1, -2); vLp.topMargin = dp(6);
+        LinearLayout.LayoutParams vLp = lp(-1, -2);
+        vLp.topMargin = dp(6);
         chip.addView(v, vLp);
         return v;
     }
@@ -248,9 +270,6 @@ public class MainActivity extends Activity {
         }
         Intent start = new Intent(this, DiagnosticService.class).setAction(DiagnosticService.ACTION_START);
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(start); else startService(start);
-        if (isSafeShizukuAvailable() && Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-            try { Shizuku.requestPermission(SHIZUKU_REQUEST); } catch (Throwable ignored) {}
-        }
     }
 
     private void sendMarker(String action) {
@@ -262,53 +281,53 @@ public class MainActivity extends Activity {
     }
 
     private void onShizukuClick() {
+        if (!isRunning()) {
+            Toast.makeText(this, "Сначала запусти базовую диагностику. Enhanced включается отдельно.", Toast.LENGTH_LONG).show();
+            return;
+        }
         try {
             if (!Shizuku.pingBinder()) {
                 Intent launch = getPackageManager().getLaunchIntentForPackage("moe.shizuku.privileged.api");
                 if (launch != null) startActivity(launch);
-                else Toast.makeText(this, "Shizuku не запущен. Базовый режим работает без него.", Toast.LENGTH_LONG).show();
+                else Toast.makeText(this, "Shizuku не запущен. Для чистого кейса он не нужен.", Toast.LENGTH_LONG).show();
                 return;
             }
             int uid = Shizuku.getUid();
             if (!ShellIdentityPolicy.isSafeBackendUid(uid)) {
-                Toast.makeText(this, "Root/unsafe Shizuku заблокирован. Нужен Wireless debugging, uid=2000.", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "Root/unsafe Shizuku заблокирован. Нужен shell uid=2000.", Toast.LENGTH_LONG).show();
                 return;
             }
             if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
                 Shizuku.requestPermission(SHIZUKU_REQUEST);
-            } else if (isRunning()) {
-                startService(new Intent(this, DiagnosticService.class).setAction(DiagnosticService.ACTION_START));
-                Toast.makeText(this, "Перепроверяю безопасный Shizuku", Toast.LENGTH_SHORT).show();
+            } else {
+                startService(new Intent(this, DiagnosticService.class)
+                        .setAction(DiagnosticService.ACTION_ENABLE_ENHANCED));
+                Toast.makeText(this, "Enhanced mode включается отдельно от чистого теста", Toast.LENGTH_SHORT).show();
             }
         } catch (Throwable t) {
             Toast.makeText(this, "Shizuku недоступен — базовый режим остаётся активным", Toast.LENGTH_SHORT).show();
         }
     }
 
-    private boolean isSafeShizukuAvailable() {
-        try { return Shizuku.pingBinder() && ShellIdentityPolicy.isSafeBackendUid(Shizuku.getUid()); }
-        catch (Throwable t) { return false; }
-    }
-
     private void refreshShizuku() {
         try {
             if (!Shizuku.pingBinder()) {
-                shizukuStatus.setText("Shizuku: недоступен · базовая диагностика всё равно работает");
+                shizukuStatus.setText("Shizuku: недоступен · для чистого теста это нормально");
                 shizukuStatus.setTextColor(C_MUTED);
                 return;
             }
             int uid = Shizuku.getUid();
             if (!ShellIdentityPolicy.isSafeBackendUid(uid)) {
-                shizukuStatus.setText("Shizuku: ЗАБЛОКИРОВАН unsafe/root uid=" + uid + " · базовый режим безопасен");
+                shizukuStatus.setText("Shizuku: ЗАБЛОКИРОВАН unsafe/root uid=" + uid);
                 shizukuStatus.setTextColor(C_BAD);
                 return;
             }
             if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                shizukuStatus.setText("Shizuku: shell uid=2000 · разрешён · нажми для перепроверки");
-                shizukuStatus.setTextColor(C_OK);
-            } else {
-                shizukuStatus.setText("Shizuku: shell uid=2000 · нажми, чтобы разрешить расширенную диагностику");
+                shizukuStatus.setText("Shizuku: shell uid=2000 · enhanced выключен по умолчанию · нажми только для A/B");
                 shizukuStatus.setTextColor(C_WARN);
+            } else {
+                shizukuStatus.setText("Shizuku: shell uid=2000 · разрешение не выдано · base mode чистый");
+                shizukuStatus.setTextColor(C_MUTED);
             }
         } catch (Throwable t) {
             shizukuStatus.setText("Shizuku: недоступен · базовая диагностика работает");
@@ -365,11 +384,14 @@ public class MainActivity extends Activity {
         usbValue.setText(safe(usb, "—"));
         accessoryValue.setText(safe(accessory, "—"));
         aaValue.setText(safe(aa, "—"));
-        int color = "GOOD".equals(level) ? C_OK : "WARN".equals(level) ? C_WARN : "BAD".equals(level) ? C_BAD : "INFO".equals(level) ? C_INFO : C_MUTED;
+        int color = "GOOD".equals(level) ? C_OK
+                : "WARN".equals(level) ? C_WARN
+                : "BAD".equals(level) ? C_BAD
+                : "INFO".equals(level) ? C_INFO : C_MUTED;
         statusDot.setTextColor(color);
         statusHint.setText("GOOD".equals(level) ? "Handshake/accessory уже появился."
                 : "WARN".equals(level) ? "Есть признак зависания — поставь метку, если AA не стартовал."
-                : isRunning() ? "Слушаю USB-события. Поллинг dumpsys выключен."
+                : isRunning() ? "Слушаю каждый USB_STATE. Никакого dumpsys polling в base mode."
                 : "Запусти диагностику до подключения кабеля.");
     }
 
@@ -403,17 +425,20 @@ public class MainActivity extends Activity {
         if (empty != null) eventContainer.removeView(empty);
         LinearLayout item = column();
         item.setPadding(dp(2), dp(10), dp(2), dp(10));
-        TextView head = text(new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(new Date(time)) + "   " + title,
-                12, severityColor(severity), true);
+        TextView head = text(new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(new Date(time))
+                        + "   " + title, 12, severityColor(severity), true);
         item.addView(head, lp(-1, -2));
         if (detail != null && !detail.isBlank()) {
             TextView d = text(detail, 11, C_MUTED, false);
-            LinearLayout.LayoutParams dLp = lp(-1, -2); dLp.topMargin = dp(4);
+            LinearLayout.LayoutParams dLp = lp(-1, -2);
+            dLp.topMargin = dp(4);
             item.addView(d, dLp);
         }
         if (newestFirst) eventContainer.addView(item, 0, lp(-1, -2));
         else eventContainer.addView(item, lp(-1, -2));
-        while (eventContainer.getChildCount() > 18) eventContainer.removeViewAt(eventContainer.getChildCount() - 1);
+        while (eventContainer.getChildCount() > 18) {
+            eventContainer.removeViewAt(eventContainer.getChildCount() - 1);
+        }
     }
 
     private int severityColor(String severity) {
@@ -424,45 +449,75 @@ public class MainActivity extends Activity {
     }
 
     private void maybeAskNotifications() {
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 8404);
         }
     }
 
-    private LinearLayout column() { LinearLayout v = new LinearLayout(this); v.setOrientation(LinearLayout.VERTICAL); return v; }
-    private LinearLayout row() { LinearLayout v = new LinearLayout(this); v.setOrientation(LinearLayout.HORIZONTAL); return v; }
+    private LinearLayout column() {
+        LinearLayout v = new LinearLayout(this);
+        v.setOrientation(LinearLayout.VERTICAL);
+        return v;
+    }
+
+    private LinearLayout row() {
+        LinearLayout v = new LinearLayout(this);
+        v.setOrientation(LinearLayout.HORIZONTAL);
+        return v;
+    }
 
     private TextView text(String value, float sp, int color, boolean bold) {
         TextView v = new TextView(this);
-        v.setText(value); v.setTextSize(sp); v.setTextColor(color);
+        v.setText(value);
+        v.setTextSize(sp);
+        v.setTextColor(color);
         if (bold) v.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         return v;
     }
 
     private Button button(String value, int bg, int fg) {
         Button b = new Button(this);
-        b.setText(value); b.setTextColor(fg); b.setTextSize(15); b.setAllCaps(false);
-        b.setTypeface(Typeface.DEFAULT, Typeface.BOLD); b.setGravity(Gravity.CENTER);
+        b.setText(value);
+        b.setTextColor(fg);
+        b.setTextSize(15);
+        b.setAllCaps(false);
+        b.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        b.setGravity(Gravity.CENTER);
         b.setBackground(round(bg, 16, 0, 0));
         return b;
     }
 
     private Button miniButton(String value) {
         Button b = button(value, C_CARD_2, C_TEXT);
-        b.setTextSize(11); b.setPadding(dp(4), 0, dp(4), 0);
+        b.setTextSize(11);
+        b.setPadding(dp(4), 0, dp(4), 0);
         return b;
     }
 
     private GradientDrawable round(int color, int radiusDp, int strokeColor, int strokeDp) {
-        GradientDrawable d = new GradientDrawable(); d.setColor(color); d.setCornerRadius(dp(radiusDp));
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(color);
+        d.setCornerRadius(dp(radiusDp));
         if (strokeDp > 0) d.setStroke(dp(strokeDp), strokeColor);
         return d;
     }
 
-    private LinearLayout.LayoutParams lp(int w, int h) { return new LinearLayout.LayoutParams(w, h); }
-    private LinearLayout.LayoutParams weight(int w, int h, float weight) { return new LinearLayout.LayoutParams(w, h, weight); }
-    private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
-    private static String safe(String value, String fallback) { return value == null ? fallback : value; }
+    private LinearLayout.LayoutParams lp(int w, int h) {
+        return new LinearLayout.LayoutParams(w, h);
+    }
+
+    private LinearLayout.LayoutParams weight(int w, int h, float weight) {
+        return new LinearLayout.LayoutParams(w, h, weight);
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private static String safe(String value, String fallback) {
+        return value == null ? fallback : value;
+    }
 
     @Override protected void onDestroy() {
         try { unregisterReceiver(diagnosticReceiver); } catch (Throwable ignored) {}

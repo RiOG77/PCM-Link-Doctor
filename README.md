@@ -2,199 +2,214 @@
 
 Диагностическое Android-приложение для кейса **Samsung Galaxy ↔ проводной Android Auto ↔ Porsche PCM**.
 
-Текущая версия: **0.2.0 Knox-safe**.
+Текущая версия: **0.2.1 Knox-safe**.
 
-## Задача
+## Что мы уже подтвердили
 
-Поймать разницу между двумя сценариями:
+В двух чистых полевых тестах без Shizuku и без `adb` воспроизведён один и тот же сценарий:
 
-1. телефон подключён к PCM, но Android Auto автоматически не стартует;
-2. пользователь вручную включает `Передача изображений / PTP`, после USB re-enumeration появляется `accessory` и Android Auto начинает работать.
+1. USB подключается;
+2. телефон достигает `connected=true, configured=true`;
+3. `accessory=false` остаётся десятки секунд;
+4. пользователь вручную включает PTP;
+5. начинается USB re-enumeration (`configured true → false → true/false`);
+6. примерно через 2.1–2.2 с появляется `accessory=true`;
+7. Android Auto запускается.
+
+Это означает, что PTP нужен не как рабочий режим Android Auto, а как триггер повторной USB-инициализации, после которой AOA/accessory handshake проходит.
 
 Главный принцип проекта: **observe, do not modify**.
 
-## Что изменено после security review
+## Что нового в v0.2.1
 
-### 1. Больше нет произвольного shell
+### Clean base mode по умолчанию
 
-AIDL принимает только `String[] argv`. `ShellUserService` запускает `ProcessBuilder(argv)` напрямую — без `sh -c`, пайпов, редиректов и command substitution.
+Запуск диагностики больше **не включает Shizuku автоматически и не запрашивает его permission**.
 
-`ShellCommandPolicy` разрешает только точные read-only формы:
+Base mode рассчитан именно на чистый кейс, где USB debugging выключен. Это критично для текущего Samsung: при включённой USB debugging Android Auto запускается стабильно, поэтому такой тест считается грязным.
 
-- `/system/bin/getprop sys.usb.state`
-- `/system/bin/getprop sys.usb.config`
-- `/system/bin/getprop persist.sys.usb.config`
-- `/system/bin/dumpsys usb`
-- `/system/bin/ps -A`
-- фиксированный read-only `logcat` с буферами `main/system/events/crash` и `-T`.
+Enhanced/Shizuku теперь включается только вручную отдельным действием и используется только для A/B сравнения.
 
-Любой другой argv отклоняется внутри `ShellUserService`.
+### Полный поток USB_STATE
 
-### 2. Knox-safe Shizuku
+Теперь сохраняется **каждый** `android.hardware.usb.action.USB_STATE`, даже если fingerprint состояния не изменился.
 
-До `bindUserService` вызывается `Shizuku.getUid()`.
-
-Разрешён только backend:
+Файл:
 
 ```text
-uid=2000
+usb_state_events.txt
 ```
 
-Root/любой другой UID блокируется **до запуска Shizuku UserService**.
+Для каждого broadcast пишутся:
 
-После bind дополнительно проверяются:
+- последовательный номер;
+- wall clock;
+- `elapsedRealtime`;
+- `elapsedRealtimeNanos`;
+- интервал от предыдущего broadcast;
+- источник (`broadcast` / `register_sticky`);
+- все безопасно сериализуемые extras.
+
+Это позволяет увидеть повторные USB_STATE, скрытые дополнительные Samsung extras и точную последовательность re-enumeration.
+
+### Handshake checkpoints
+
+После каждого перехода в `configured=true` ставятся пассивные контрольные точки на 2, 5, 10 и 30 сек.
+
+Файл:
+
+```text
+handshake_checkpoints.txt
+```
+
+На 10-й секунде без `accessory` фиксируется stuck handshake.
+
+### Автоматическая классификация
+
+Новый `HandshakeForensics` считает:
+
+- число `configured` rise/drop;
+- re-enumeration count;
+- stuck handshake count;
+- initial configured → accessory;
+- last configured → accessory;
+- PTP → config drop;
+- PTP → accessory;
+- config drop → accessory.
+
+Если подтверждён сценарий:
+
+```text
+configured без accessory
+→ PTP
+→ config drop/re-enumeration
+→ accessory <= 5 s
+```
+
+в `findings.txt` появляется:
+
+```text
+pattern=PTP_REENUMERATION_RECOVERS_AOA
+```
+
+Также приложение явно пишет:
+
+```text
+clean_base_case=true/false
+```
+
+Кейс считается clean, только если не замечен проводной `adb` и enhanced Shizuku реально не использовался.
+
+### Accessory metadata
+
+Только **после того, как accessory уже появился**, приложение read-only читает `UsbManager.getAccessoryList()` и сохраняет безопасные поля в:
+
+```text
+accessory_info.txt
+```
+
+Serial намеренно не сохраняется.
+
+### Дополнительные USB broadcasts
+
+Read-only listener также пишет, если Android реально доставляет приложению:
+
+- `USB_PORT_CHANGED`;
+- `ACTION_USB_DEVICE_ATTACHED/DETACHED`;
+- `ACTION_USB_ACCESSORY_ATTACHED/DETACHED`.
+
+Файл:
+
+```text
+usb_aux_events.txt
+```
+
+## Knox-safe / Shizuku policy
+
+Проект не использует:
+
+- root / `su`;
+- Magisk / Sui;
+- OEM Unlock;
+- bootloader unlock;
+- custom firmware/kernel/recovery;
+- системные writes;
+- изменение USB mode;
+- изменение Android Auto/PCM.
+
+Если пользователь вручную включает enhanced mode, до `bindUserService` обязательно проверяется:
+
+```text
+Shizuku.getUid() == 2000
+```
+
+После bind дополнительно:
 
 ```text
 uid=2000
 SELinux=u:r:shell:s0
 ```
 
-Диагностический движок получает не raw `IRemoteShell`, а только `VerifiedShell`.
+Arbitrary shell отсутствует. `ShellUserService` принимает только argv и запускает `ProcessBuilder(argv)` без `sh -c`.
 
-При перезапуске Shizuku binder identity проверяется заново. Root fallback отсутствует.
+## Разрешённые shell-команды enhanced mode
 
-### 3. Базовая диагностика работает без Shizuku
-
-Shizuku теперь необязателен.
-
-Основной источник USB-состояния — события Android:
+Только точные read-only формы:
 
 ```text
-android.hardware.usb.action.USB_STATE
-ACTION_USB_ACCESSORY_ATTACHED
-ACTION_USB_ACCESSORY_DETACHED
-ACTION_BATTERY_CHANGED
+/system/bin/getprop sys.usb.state
+/system/bin/getprop sys.usb.config
+/system/bin/getprop persist.sys.usb.config
+/system/bin/dumpsys usb
+/system/bin/ps -A
+/system/bin/logcat ... -T <timestamp> -d
 ```
 
-Если Shizuku пропал или не был запущен, timeline и ручные маркеры продолжают работать.
-
-### 4. Убран polling `dumpsys usb`
-
-`dumpsys usb` больше не вызывается каждые 1.2 секунды.
-
-Тяжёлый snapshot снимается только после события, когда handshake уже изменился, либо по ручной метке:
-
-- stuck handshake;
-- accessory attached/stable;
-- `AA не запустился`;
-- `После PTP заработало`.
-
-Это уменьшает observer effect во время USB handshake.
-
-### 5. Stuck handshake
-
-Таймер запускается только от:
-
-```text
-connected=true && configured=true
-```
-
-`USB powered=true` больше не считается признаком подключения к автомобилю.
-
-Есть отдельная ручная метка:
-
-```text
-Подключил к авто
-```
-
-### 6. Точные метрики
-
-Для USB-событий сохраняются одновременно:
-
-- wall-clock;
-- `SystemClock.elapsedRealtime()`.
-
-Считаются:
-
-- attach count;
-- detach count;
-- flapping transitions;
-- attach → accessory, ms;
-- PTP → accessory, ms;
-- длительность accessory-сессий.
-
-### 7. Android Auto
-
-Наличие основного процесса Android Auto не считается доказательством проекции.
-
-В enhanced snapshot отдельно ищется:
-
-```text
-com.google.android.projection.gearhead:projection
-```
-
-В logcat сохраняются релевантные USB/AOA/gearhead/car-события; общий `projection` без контекста Android Auto игнорируется, чтобы не ловить MediaProjection.
-
-### 8. Samsung context
-
-Диагностика фиксирует:
-
-- screen interactive state;
-- keyguard locked state;
-- `persist.sys.usb.config` при доступном безопасном Shizuku;
-- Type-C / power/data role из event-triggered `dumpsys usb`;
-- появление `adb` в USB function set.
-
-Если `adb=true` появляется на проводном USB, в timeline пишется предупреждение об observer effect. Для Shizuku рекомендуется только **Wireless debugging**.
-
-Auto Blocker приложением не переключается и не читается через private settings. При анализе его состояние проверяется отдельно вручную.
+Base mode эти команды вообще не использует.
 
 ## Privacy
 
-- permission `INTERNET` отсутствует;
-- backend отсутствует;
+- `INTERNET` permission отсутствует;
 - storage permissions отсутствуют;
-- экспорт — через Android SAF `ACTION_CREATE_DOCUMENT`;
+- экспорт через SAF `ACTION_CREATE_DOCUMENT`;
 - `allowBackup=false`;
-- `dataExtractionRules` исключают диагностические данные из cloud backup/device transfer;
-- перед записью применяется redaction для MAC/BSSID/SSID/IP/email/serial-like данных;
+- диагностические данные исключены из backup/device transfer;
+- перед записью применяется redaction MAC/BSSID/SSID/IP/email/serial-like данных;
 - полный `getprop` не используется.
 
-## Permissions APK
-
-CI проверяет фактический APK через `aapt2 dump permissions`.
-
-Ожидаемые права:
+## Основные файлы ZIP v0.2.1
 
 ```text
-android.permission.FOREGROUND_SERVICE
-android.permission.FOREGROUND_SERVICE_SPECIAL_USE
-android.permission.POST_NOTIFICATIONS
-android.permission.WAKE_LOCK
-moe.shizuku.manager.permission.API_V23
+device.txt
+timeline.txt
+raw_usb.txt
+usb_state_events.txt
+usb_aux_events.txt
+handshake_checkpoints.txt
+accessory_info.txt
+findings.txt
+metrics.txt
+snapshots.txt
+usb_props.txt                 (только enhanced)
+logcat_filtered.txt           (только enhanced)
+log_repeat_stats.txt
+shell_identity.txt            (только enhanced)
 ```
 
-Также AndroidX добавляет package-local `DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`.
+## Чистый тест в Porsche
 
-CI падает, если появляются `INTERNET`, storage, install-packages, secure-settings или usage-stats permissions.
-
-## Тестирование
-
-Unit-тестами покрыты:
-
-- `uid=0` → отказ;
-- `uid=2000` + неправильный SELinux context → отказ;
-- `uid=2000` + `u:r:shell:s0` → допуск;
-- запрет `sh -c`;
-- запрет `dumpsys battery unplug/reset`;
-- запрет `logcat -c/-f`;
-- запрет произвольного `getprop`;
-- запрет неизвестных executable/argv.
-
-Дополнительно `scripts/ci_safety_check.sh` проверяет production-код и manifest на запрещённые команды/permissions.
-
-## Сценарий теста в машине
-
-1. Запустить PCM Link Doctor **до подключения кабеля**.
-2. При наличии Shizuku использовать только Wireless debugging. OEM Unlock не нужен и не должен включаться.
-3. Нажать `Начать диагностику`.
-4. Подключить телефон к Porsche PCM.
-5. Нажать `Подключил к авто`.
-6. Если Android Auto не стартовал — нажать `AA не запустился`.
-7. Стандартным UI Samsung переключить USB в `Передача изображений / PTP`.
-8. Если Android Auto запустился — нажать `После PTP заработало`.
-9. Остановить диагностику.
-10. Экспортировать ZIP через системный диалог Android.
+1. USB debugging — OFF.
+2. Wireless debugging — OFF.
+3. Shizuku не нужен.
+4. Запустить PCM Link Doctor **до подключения кабеля**.
+5. Нажать `Начать диагностику`.
+6. Подключить телефон к Porsche PCM.
+7. Нажать `Подключил к авто`.
+8. Если AA не стартовал — `AA не запустился`.
+9. В Samsung вручную выбрать `Передача изображений / PTP`.
+10. Когда AA запустился — `После PTP заработало`.
+11. Остановить диагностику.
+12. Экспортировать ZIP.
 
 ## Build
 
@@ -205,13 +220,16 @@ Unit-тестами покрыты:
 - targetSdk 36
 - minSdk 29
 
-После фиксации wrapper сборка выполняется только через:
+CI выполняет:
 
 ```bash
+bash scripts/ci_safety_check.sh
 ./gradlew --no-daemon :app:testDebugUnitTest
 ./gradlew --no-daemon :app:assembleDebug
 ```
 
+и проверяет итоговый APK через `aapt2 dump permissions`.
+
 ## Ограничение
 
-Это диагностический prototype. Наличие read-only архитектуры и отсутствие boot/root операций не заменяет независимый code review перед использованием на критичном устройстве. Проект специально не содержит функций автоматического «ремонта» USB/Android Auto.
+Base mode специально не пытается читать закрытые USB HAL/Type-C/kernel детали через ADB: это сделало бы текущий кейс нечистым. v0.2.1 усиливает именно непривилегированное наблюдение за реальной последовательностью Android USB events.

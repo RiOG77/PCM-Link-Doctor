@@ -14,9 +14,11 @@ import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.hardware.usb.UsbAccessory;
 import android.hardware.usb.UsbManager;
 import android.os.BatteryManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -24,8 +26,10 @@ import android.os.PowerManager;
 import android.os.SystemClock;
 
 import java.io.File;
+import java.lang.reflect.Array;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -42,6 +46,7 @@ import rikka.shizuku.Shizuku;
 public class DiagnosticService extends Service {
     public static final String ACTION_START = "com.pcmlink.doctor.START";
     public static final String ACTION_STOP = "com.pcmlink.doctor.STOP";
+    public static final String ACTION_ENABLE_ENHANCED = "com.pcmlink.doctor.ENABLE_ENHANCED";
     public static final String ACTION_MARK_CAR = "com.pcmlink.doctor.MARK_CAR";
     public static final String ACTION_MARK_FAILED = "com.pcmlink.doctor.MARK_FAILED";
     public static final String ACTION_MARK_RECOVERED = "com.pcmlink.doctor.MARK_RECOVERED";
@@ -57,9 +62,9 @@ public class DiagnosticService extends Service {
     public static final String KEY_LEVEL = "level";
 
     private static final String USB_STATE_ACTION = "android.hardware.usb.action.USB_STATE";
+    private static final String USB_PORT_CHANGED_ACTION = "android.hardware.usb.action.USB_PORT_CHANGED";
     private static final int NOTIFICATION_ID = 8401;
     private static final String CHANNEL_ID = "pcm_link_diagnostics";
-    private static final long STUCK_MS = 10_000L;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
@@ -67,12 +72,14 @@ public class DiagnosticService extends Service {
     private final Map<String, Integer> logSignatureCounts = new ConcurrentHashMap<>();
     private final List<Long> attachToAccessoryMs = new ArrayList<>();
     private final List<Long> accessoryDurationsMs = new ArrayList<>();
+    private final HandshakeForensics forensics = new HandshakeForensics();
 
     private File sessionDir;
     private PowerManager.WakeLock wakeLock;
     private VerifiedShell shell;
     private Shizuku.UserServiceArgs userServiceArgs;
     private boolean bindingShell;
+    private boolean enhancedRequested;
     private boolean enhancedEverAvailable;
     private boolean receiverRegistered;
     private boolean started;
@@ -91,31 +98,25 @@ public class DiagnosticService extends Service {
     private long attachElapsed = -1L;
     private long ptpElapsed = -1L;
     private long accessoryStartElapsed = -1L;
+    private long lastUsbBroadcastElapsed = -1L;
     private int attachCount;
     private int detachCount;
+    private int usbStateBroadcastCount;
     private String lastUsbFingerprint = "";
     private String lastPropsFingerprint = "";
     private long logCursorMs;
     private Boolean lastInteractive;
     private Boolean lastKeyguardLocked;
 
-    private final Runnable stuckCheck = () -> {
-        if (!started || !usbConnected || !usbConfigured || usbAccessory) return;
-        event("WARN", "Возможен зависший handshake",
-                "USB connected+configured уже 10 с, но accessory mode не появился"
-                        + (carMarked ? "; пользователь отметил подключение к авто" : ""));
-        captureDeepSnapshot("stuck_handshake");
-    };
-
     private final Shizuku.OnBinderReceivedListener binderReceivedListener = () -> {
-        if (!started) return;
+        if (!started || !enhancedRequested) return;
         verifyBackendAndMaybeBind("Shizuku binder received");
     };
 
     private final Shizuku.OnBinderDeadListener binderDeadListener = () -> {
         shell = null;
         bindingShell = false;
-        if (started) {
+        if (started && enhancedRequested) {
             event("WARN", "Shizuku потерян", "Продолжаю базовую USB-диагностику без Shizuku");
             publishState();
         }
@@ -147,7 +148,7 @@ public class DiagnosticService extends Service {
         @Override public void onServiceDisconnected(ComponentName name) {
             shell = null;
             bindingShell = false;
-            if (started) {
+            if (started && enhancedRequested) {
                 event("WARN", "Shizuku UserService отключён", "Базовая диагностика продолжает работать");
                 publishState();
             }
@@ -159,12 +160,19 @@ public class DiagnosticService extends Service {
             if (!started || intent == null || intent.getAction() == null) return;
             String action = intent.getAction();
             if (USB_STATE_ACTION.equals(action)) {
-                handleUsbState(intent);
+                handleUsbState(intent, "broadcast");
             } else if (UsbManager.ACTION_USB_ACCESSORY_ATTACHED.equals(action)) {
+                recordAuxEvent(intent, "accessory_attached");
                 event("GOOD", "USB accessory attached", "UsbManager ACTION_USB_ACCESSORY_ATTACHED");
+                recordAccessoryInfo("ACTION_USB_ACCESSORY_ATTACHED");
                 mainHandler.postDelayed(() -> captureDeepSnapshot("accessory_attached"), 1200L);
             } else if (UsbManager.ACTION_USB_ACCESSORY_DETACHED.equals(action)) {
+                recordAuxEvent(intent, "accessory_detached");
                 event("INFO", "USB accessory detached", "UsbManager ACTION_USB_ACCESSORY_DETACHED");
+            } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)
+                    || UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)
+                    || USB_PORT_CHANGED_ACTION.equals(action)) {
+                recordAuxEvent(intent, "usb_aux");
             } else if (Intent.ACTION_BATTERY_CHANGED.equals(action)) {
                 handleBattery(intent);
             } else if (Intent.ACTION_SCREEN_ON.equals(action)) {
@@ -195,22 +203,32 @@ public class DiagnosticService extends Service {
         }
         if (!started) startDiagnostics();
 
-        if (ACTION_MARK_CAR.equals(action)) {
+        if (ACTION_ENABLE_ENHANCED.equals(action)) {
+            if (!enhancedRequested) {
+                enhancedRequested = true;
+                event("WARN", "Запрошен enhanced mode",
+                        "Отдельный A/B режим: не использовать для чистого кейса, если USB debugging меняет Android Auto");
+            }
+            verifyBackendAndMaybeBind("explicit enhanced request");
+        } else if (ACTION_MARK_CAR.equals(action)) {
             carMarked = true;
             event("INFO", "Метка: подключено к авто", currentUsbSummary() + "; " + lockState());
             captureLightSnapshot("manual_car_marker");
         } else if (ACTION_MARK_FAILED.equals(action)) {
             event("BAD", "Метка: AA не запустился", currentUsbSummary() + "; " + lockState());
             captureDeepSnapshot("marker_failed");
+            writeFindings();
         } else if (ACTION_MARK_RECOVERED.equals(action)) {
             event("GOOD", "Метка: после PTP заработало", currentUsbSummary() + "; " + lockState());
             captureDeepSnapshot("marker_recovered");
+            writeFindings();
         }
         return START_STICKY;
     }
 
     private void startDiagnostics() {
         started = true;
+        enhancedRequested = false;
         sessionDir = SessionStore.startSession(this);
         getSharedPreferences(PREF, MODE_PRIVATE).edit().putBoolean(KEY_RUNNING, true).apply();
         Notification notification = buildNotification();
@@ -223,9 +241,8 @@ public class DiagnosticService extends Service {
         registerSystemSignals();
         logCursorMs = Math.max(0, System.currentTimeMillis() - 3000L);
         event("INFO", "Диагностика запущена",
-                "Базовый событийный режим активен; Shizuku опционален");
+                "Чистый базовый режим активен; Shizuku/enhanced не включается автоматически");
         logLockStateIfChanged("session_start");
-        verifyBackendAndMaybeBind("session start");
         logScheduler.scheduleAtFixedRate(this::captureLogcatWindow, 2, 4, TimeUnit.SECONDS);
         publishState();
     }
@@ -234,8 +251,11 @@ public class DiagnosticService extends Service {
         if (receiverRegistered) return;
         IntentFilter filter = new IntentFilter();
         filter.addAction(USB_STATE_ACTION);
+        filter.addAction(USB_PORT_CHANGED_ACTION);
         filter.addAction(UsbManager.ACTION_USB_ACCESSORY_ATTACHED);
         filter.addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
         filter.addAction(Intent.ACTION_BATTERY_CHANGED);
         filter.addAction(Intent.ACTION_SCREEN_ON);
         filter.addAction(Intent.ACTION_SCREEN_OFF);
@@ -248,14 +268,16 @@ public class DiagnosticService extends Service {
         }
         receiverRegistered = true;
         if (sticky != null) {
-            if (USB_STATE_ACTION.equals(sticky.getAction())) handleUsbState(sticky);
+            if (USB_STATE_ACTION.equals(sticky.getAction())) handleUsbState(sticky, "register_sticky");
             if (Intent.ACTION_BATTERY_CHANGED.equals(sticky.getAction())) handleBattery(sticky);
         }
     }
 
-    private void handleUsbState(Intent intent) {
+    private void handleUsbState(Intent intent, String source) {
         usbStateSeen = true;
         long now = SystemClock.elapsedRealtime();
+        recordUsbStateBroadcast(intent, source, now);
+
         boolean connected = intent.getBooleanExtra("connected", false);
         boolean configured = intent.getBooleanExtra("configured", false);
         boolean accessory = intent.getBooleanExtra("accessory", false);
@@ -269,27 +291,31 @@ public class DiagnosticService extends Service {
             attachCount++;
             attachElapsed = now;
             ptpElapsed = -1L;
+            forensics.onAttach(now);
             event("INFO", "USB подключён", "USB_STATE connected=true");
         }
         if (!connected && usbConnected) {
             detachCount++;
             finishAccessoryDuration(now);
+            forensics.onDetach();
             event("INFO", "USB отключён", "USB_STATE connected=false");
-            mainHandler.removeCallbacks(stuckCheck);
             attachElapsed = -1L;
             ptpElapsed = -1L;
         }
         if (configured && !usbConfigured) {
-            event("INFO", "USB сконфигурирован", "connected=true, configured=true");
-            mainHandler.removeCallbacks(stuckCheck);
-            mainHandler.postDelayed(stuckCheck, STUCK_MS);
+            int cycle = forensics.onConfiguredRise(now);
+            String suffix = cycle > 1 ? "; configured cycle=" + cycle + " (re-enumeration candidate)" : "; configured cycle=1";
+            event("INFO", "USB сконфигурирован", "connected=true, configured=true" + suffix);
+            scheduleHandshakeCheckpoints(cycle);
         }
         if (!configured && usbConfigured && connected) {
-            event("WARN", "USB configuration потеряна", "connected=true, configured=false");
-            mainHandler.removeCallbacks(stuckCheck);
+            forensics.onConfiguredDrop(now);
+            event("WARN", "USB configuration потеряна",
+                    "connected=true, configured=false; drops=" + forensics.configuredDropWhileConnectedCount());
         }
         if (ptp && !usbPtp) {
             ptpElapsed = now;
+            forensics.onPtp(now);
             event("INFO", "PTP включён", "USB_STATE ptp=true");
         }
         if (mtp && !usbMtp) {
@@ -299,20 +325,29 @@ public class DiagnosticService extends Service {
             if (adb) {
                 wiredAdbSeen = true;
                 event("WARN", "В USB-конфигурации появился adb",
-                        "Это меняет наблюдаемую USB-конфигурацию; для теста используйте Wireless debugging");
+                        "Кейс помечен dirty: проводной ADB меняет USB function set и может запускать Android Auto");
             } else {
                 event("INFO", "adb исчез из USB-конфигурации", "USB_STATE adb=false");
             }
         }
         if (accessory && !usbAccessory) {
             accessoryStartElapsed = now;
-            mainHandler.removeCallbacks(stuckCheck);
             long fromAttach = attachElapsed > 0 ? now - attachElapsed : -1L;
             if (fromAttach >= 0) attachToAccessoryMs.add(fromAttach);
+            HandshakeForensics.AccessoryResult result = forensics.onAccessory(now);
             StringBuilder detail = new StringBuilder("accessory=true");
             if (fromAttach >= 0) detail.append("; attach→accessory=").append(fromAttach).append(" ms");
+            if (result.initialConfiguredToAccessoryMs >= 0) {
+                detail.append("; initial configured→accessory=").append(result.initialConfiguredToAccessoryMs).append(" ms");
+            }
             if (ptpElapsed > 0) detail.append("; PTP→accessory=").append(now - ptpElapsed).append(" ms");
+            if (result.configDropToAccessoryMs >= 0) {
+                detail.append("; last config drop→accessory=").append(result.configDropToAccessoryMs).append(" ms");
+            }
+            if (result.ptpReenumerationRecovery) detail.append("; pattern=PTP_REENUMERATION_RECOVERS_AOA");
             event("GOOD", ptpElapsed > 0 ? "PTP → accessory" : "Accessory mode активирован", detail.toString());
+            recordAccessoryInfo("USB_STATE accessory=true");
+            writeFindings();
             mainHandler.postDelayed(() -> captureDeepSnapshot("accessory_stable"), 1200L);
         }
         if (!accessory && usbAccessory) {
@@ -332,6 +367,138 @@ public class DiagnosticService extends Service {
             logLockStateIfChanged("usb_state");
             captureLightSnapshot("usb_state_change");
             publishState();
+        }
+    }
+
+    private void scheduleHandshakeCheckpoints(int cycle) {
+        scheduleHandshakeCheckpoint(2_000L, cycle);
+        scheduleHandshakeCheckpoint(5_000L, cycle);
+        scheduleHandshakeCheckpoint(10_000L, cycle);
+        scheduleHandshakeCheckpoint(30_000L, cycle);
+    }
+
+    private void scheduleHandshakeCheckpoint(long delayMs, int cycle) {
+        mainHandler.postDelayed(() -> {
+            if (!started || !usbConnected || !usbConfigured || usbAccessory) return;
+            if (forensics.configuredRiseCount() != cycle) return;
+            long now = SystemClock.elapsedRealtime();
+            long fromRise = forensics.lastConfiguredRiseElapsed() >= 0
+                    ? now - forensics.lastConfiguredRiseElapsed() : -1L;
+            SessionStore.append(sessionDir, "handshake_checkpoints.txt",
+                    SessionStore.isoNow() + " elapsed=" + now
+                            + " cycle=" + cycle + " waited_ms=" + fromRise
+                            + " state=" + currentUsbSummary());
+            if (delayMs == 10_000L) {
+                forensics.onStuck();
+                event("WARN", "Возможен зависший handshake",
+                        "USB connected+configured уже 10 с, но accessory mode не появился"
+                                + (carMarked ? "; пользователь отметил подключение к авто" : ""));
+                captureDeepSnapshot("stuck_handshake");
+                writeFindings();
+            }
+        }, delayMs);
+    }
+
+    private void recordUsbStateBroadcast(Intent intent, String source, long now) {
+        usbStateBroadcastCount++;
+        long delta = lastUsbBroadcastElapsed >= 0 ? now - lastUsbBroadcastElapsed : -1L;
+        lastUsbBroadcastElapsed = now;
+        SessionStore.append(sessionDir, "usb_state_events.txt",
+                "seq=" + usbStateBroadcastCount
+                        + " wall=" + System.currentTimeMillis()
+                        + " iso=" + SessionStore.isoNow()
+                        + " elapsed=" + now
+                        + " elapsed_nanos=" + SystemClock.elapsedRealtimeNanos()
+                        + " delta_prev_ms=" + delta
+                        + " source=" + source
+                        + " extras=" + safeIntentExtras(intent));
+    }
+
+    private void recordAuxEvent(Intent intent, String source) {
+        if (sessionDir == null || intent == null) return;
+        SessionStore.append(sessionDir, "usb_aux_events.txt",
+                "wall=" + System.currentTimeMillis()
+                        + " iso=" + SessionStore.isoNow()
+                        + " elapsed=" + SystemClock.elapsedRealtime()
+                        + " source=" + source
+                        + " action=" + intent.getAction()
+                        + " extras=" + safeIntentExtras(intent));
+    }
+
+    private static String safeIntentExtras(Intent intent) {
+        try {
+            Bundle extras = intent.getExtras();
+            if (extras == null || extras.isEmpty()) return "{}";
+            List<String> keys = new ArrayList<>(extras.keySet());
+            Collections.sort(keys);
+            StringBuilder out = new StringBuilder("{");
+            for (int i = 0; i < keys.size(); i++) {
+                String key = keys.get(i);
+                if (i > 0) out.append(", ");
+                out.append(key).append('=');
+                try {
+                    out.append(safeExtraValue(extras.get(key)));
+                } catch (Throwable t) {
+                    out.append("<unreadable:").append(t.getClass().getSimpleName()).append('>');
+                }
+            }
+            return Redactor.redact(out.append('}').toString());
+        } catch (Throwable t) {
+            return "<extras unavailable:" + t.getClass().getSimpleName() + ">";
+        }
+    }
+
+    private static String safeExtraValue(Object value) {
+        if (value == null) return "null";
+        if (value instanceof String || value instanceof CharSequence
+                || value instanceof Number || value instanceof Boolean || value instanceof Character) {
+            return Redactor.redact(String.valueOf(value));
+        }
+        Class<?> type = value.getClass();
+        if (type.isArray()) {
+            int length = Math.min(Array.getLength(value), 16);
+            StringBuilder out = new StringBuilder("[");
+            for (int i = 0; i < length; i++) {
+                if (i > 0) out.append(',');
+                Object item = Array.get(value, i);
+                if (item == null || item instanceof String || item instanceof Number || item instanceof Boolean) {
+                    out.append(Redactor.redact(String.valueOf(item)));
+                } else {
+                    out.append('<').append(item.getClass().getSimpleName()).append('>');
+                }
+            }
+            if (Array.getLength(value) > length) out.append(",…");
+            return out.append(']').toString();
+        }
+        return "<" + type.getSimpleName() + ">";
+    }
+
+    private void recordAccessoryInfo(String reason) {
+        if (sessionDir == null) return;
+        try {
+            UsbManager manager = (UsbManager) getSystemService(USB_SERVICE);
+            UsbAccessory[] accessories = manager != null ? manager.getAccessoryList() : null;
+            StringBuilder out = new StringBuilder();
+            out.append(SessionStore.isoNow()).append(" reason=").append(reason).append('\n');
+            if (accessories == null || accessories.length == 0) {
+                out.append("accessories=none\n");
+            } else {
+                out.append("accessories=").append(accessories.length).append('\n');
+                for (int i = 0; i < accessories.length; i++) {
+                    UsbAccessory a = accessories[i];
+                    out.append('#').append(i)
+                            .append(" manufacturer=").append(a.getManufacturer())
+                            .append(" model=").append(a.getModel())
+                            .append(" description=").append(a.getDescription())
+                            .append(" version=").append(a.getVersion())
+                            .append(" uri=").append(a.getUri())
+                            .append(" serial=[REDACTED]\n");
+                }
+            }
+            SessionStore.append(sessionDir, "accessory_info.txt", out.toString());
+        } catch (Throwable t) {
+            SessionStore.append(sessionDir, "accessory_info.txt",
+                    SessionStore.isoNow() + " reason=" + reason + " error=" + t.getClass().getSimpleName());
         }
     }
 
@@ -369,6 +536,7 @@ public class DiagnosticService extends Service {
     }
 
     private void verifyBackendAndMaybeBind(String reason) {
+        if (!enhancedRequested) return;
         try {
             if (!Shizuku.pingBinder()) {
                 shell = null;
@@ -386,7 +554,7 @@ public class DiagnosticService extends Service {
             }
             if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
                 shell = null;
-                event("WARN", "Shizuku без разрешения", "Базовая диагностика активна; расширенные снимки выключены");
+                event("WARN", "Shizuku без разрешения", "Базовая диагностика активна; enhanced mode не включён");
                 return;
             }
             if (bindingShell || shell != null) return;
@@ -435,7 +603,7 @@ public class DiagnosticService extends Service {
         if (s == null || sessionDir == null) {
             SessionStore.append(sessionDir, "snapshots.txt",
                     "\n=== " + reason + " " + SessionStore.isoNow() + " ===\n"
-                            + "Enhanced snapshot unavailable; Shizuku shell not verified.\n"
+                            + "Enhanced snapshot unavailable; clean base mode stays read-only.\n"
                             + currentUsbSummary() + "\n" + lockState() + "\n");
             return;
         }
@@ -467,7 +635,7 @@ public class DiagnosticService extends Service {
 
     private void captureLogcatWindow() {
         VerifiedShell s = shell;
-        if (!started || s == null || sessionDir == null) return;
+        if (!started || !enhancedRequested || s == null || sessionDir == null) return;
         long from = logCursorMs;
         long next = System.currentTimeMillis();
         try {
@@ -622,9 +790,9 @@ public class DiagnosticService extends Service {
     private void stopDiagnostics() {
         if (!started) { stopSelf(); return; }
         event("INFO", "Диагностика остановлена", "Сессия готова к экспорту через SAF");
-        mainHandler.removeCallbacks(stuckCheck);
         finishAccessoryDuration(SystemClock.elapsedRealtime());
         writeMetrics();
+        writeFindings();
         writeLogRepeatStats();
         started = false;
         getSharedPreferences(PREF, MODE_PRIVATE).edit()
@@ -653,11 +821,21 @@ public class DiagnosticService extends Service {
         out.append("flap_transitions=").append(attachCount + detachCount).append('\n');
         out.append("manual_car_marker=").append(carMarked).append('\n');
         out.append("usb_state_seen=").append(usbStateSeen).append('\n');
+        out.append("usb_state_broadcast_count=").append(usbStateBroadcastCount).append('\n');
         out.append("wired_adb_seen=").append(wiredAdbSeen).append('\n');
+        out.append("enhanced_requested=").append(enhancedRequested).append('\n');
         out.append("enhanced_shizuku_ever_available=").append(enhancedEverAvailable).append('\n');
+        out.append("clean_base_case=").append(!wiredAdbSeen && !enhancedEverAvailable).append('\n');
         out.append("attach_to_accessory_ms=").append(joinLongs(attachToAccessoryMs)).append('\n');
         out.append("accessory_session_ms=").append(joinLongs(accessoryDurationsMs)).append('\n');
+        out.append(forensics.metricsText());
         SessionStore.write(sessionDir, "metrics.txt", out.toString());
+    }
+
+    private void writeFindings() {
+        if (sessionDir == null) return;
+        SessionStore.write(sessionDir, "findings.txt",
+                forensics.findingsText(wiredAdbSeen, enhancedEverAvailable));
     }
 
     private void writeLogRepeatStats() {
@@ -702,7 +880,7 @@ public class DiagnosticService extends Service {
         return new Notification.Builder(this, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle("PCM Link Doctor")
-                .setContentText("Событийная USB / Android Auto диагностика")
+                .setContentText("Чистая событийная USB / Android Auto диагностика")
                 .setContentIntent(content)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
@@ -720,7 +898,6 @@ public class DiagnosticService extends Service {
     }
 
     @Override public void onDestroy() {
-        mainHandler.removeCallbacks(stuckCheck);
         if (receiverRegistered) {
             try { unregisterReceiver(systemReceiver); } catch (Throwable ignored) {}
             receiverRegistered = false;

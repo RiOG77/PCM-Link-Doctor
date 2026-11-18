@@ -1,0 +1,36 @@
+name: Build PCM Linker Bluetooth APK
+on:
+  push:
+    branches: [ feature/cayenne-bluetooth-linker ]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-bt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build standalone Bluetooth APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :bluetooth:assembleDebug
+      - name: Verify required/forbidden permissions
+        run: |
+          APK=bluetooth/build/outputs/apk/debug/bluetooth-debug.apk
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -type f -name aapt2 | sort -V | tail -1)
+          "$AAPT2" dump permissions "$APK" | tee /tmp/pcm-bt-permissions.txt
+          grep -Fq android.permission.BLUETOOTH_CONNECT /tmp/pcm-bt-permissions.txt
+          for p in android.permission.INTERNET android.permission.BLUETOOTH_PRIVILEGED android.permission.WRITE_SECURE_SETTINGS android.permission.READ_CONTACTS android.permission.READ_CALL_LOG; do
+            if grep -Fq "$p" /tmp/pcm-bt-permissions.txt; then echo "Forbidden permission: $p"; exit 1; fi
+          done
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCM-Linker-Bluetooth-v1.1-debug
+          path: bluetooth/build/outputs/apk/debug/bluetooth-debug.apk
+          if-no-files-found: error

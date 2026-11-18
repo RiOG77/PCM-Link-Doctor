@@ -56,10 +56,10 @@ final class LogStore {
             JSONObject e=a.optJSONObject(i);if(e==null)continue;
             String type=e.optString("type"),detail=e.optString("detail");
             if(type.equals("HFP")){
-                hfpLast=detail;if(detail.contains("CONNECTED"))seenHfp=true;
+                hfpLast=detail;if(detail.equals("state=CONNECTED"))seenHfp=true;
             }
             if(type.equals("A2DP")){
-                a2dpLast=detail;if(detail.contains("CONNECTED"))seenA2dp=true;
+                a2dpLast=detail;if(detail.equals("state=CONNECTED"))seenA2dp=true;
             }
             if(type.equals("MARK"))marked=true;
         }
